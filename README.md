@@ -16,7 +16,7 @@ Run `/hud tools` to open or close a side pane listing every tool call in the ses
 
 Run `/hud tasks` to open or close a pane with your open ClickUp tasks, grouped by status with priority and due date. Press a task's number (or click it) to put it in your prompt, or click ↗ open to open it in your browser. It needs the ClickUp connector (in auto mode, such as the Desktop app, also allow `mcp__<server>__clickup_filter_tasks` and `mcp__<server>__clickup_resolve_assignees` in `permissions.allow`; the pane names the rules to add), refreshes every 5 minutes while open, and `r` refreshes it now.
 
-Run `/hud craft` to open or close a pane with your active Craft tasks, grouped into overdue, today, later and no date. Press **✓ done** twice to mark a task done in Craft (it moves to the logbook); `u` undoes the last one. Clicking a task puts it in your prompt. It needs the Craft connector; in auto mode, also allow `mcp__<server>__craft_read` and `mcp__<server>__craft_write`.
+Run `/hud craft` to open or close a pane with your active Craft tasks, grouped into overdue, today, later and no date. Press **✓ done** twice to mark a task done in Craft (it moves to the logbook); `u` undoes the last one. Clicking a task puts it in your prompt, and ↗ open opens it in the Craft app. It needs the Craft connector; in auto mode, also allow `mcp__<server>__craft_read` and `mcp__<server>__craft_write`.
 
 Run `/hud update` to install the latest version from GitHub; it reloads plugins for you.
 

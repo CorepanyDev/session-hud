@@ -204,16 +204,21 @@ const PRIORITY_COLOR: Record<string, string> = { urgent: 'red', high: 'yellow', 
 const statusRank = (status: string) =>
   /progress|doing|review/i.test(status) ? 0 : /clarif|block|wait|hold/i.test(status) ? 2 : 1
 
-// Open a task in the browser: macOS open, else xdg-open; only ClickUp task links
-async function openTask($: EngineInterface, task: Task) {
-  if (!/^https:\/\/app\.clickup\.com\//.test(task.url)) throw new Error('not a ClickUp link')
+// Open a link with the system's handler: macOS open, else xdg-open
+async function openLink($: EngineInterface, url: string) {
   for (const opener of ['open', 'xdg-open']) {
     try {
-      const ran = await $.process.run([opener, task.url], { timeoutMs: 10000 })
+      const ran = await $.process.run([opener, url], { timeoutMs: 10000 })
       if (ran.exitCode === 0) return
     } catch {}
   }
-  throw new Error('no browser opener')
+  throw new Error('no opener')
+}
+
+// Only ClickUp task links are opened
+async function openTask($: EngineInterface, task: Task) {
+  if (!/^https:\/\/app\.clickup\.com\//.test(task.url)) throw new Error('not a ClickUp link')
+  await openLink($, task.url)
 }
 
 let craftTasks: CraftTask[] = []
@@ -221,6 +226,8 @@ let craftState: 'never' | 'loading' | 'ready' | 'error' = 'never'
 let craftError = ''
 let craftAt = 0
 let craftServer = CRAFT
+// Craft's app link for a block, from connection info: craftdocs://open?spaceId=…&blockId={blockId}
+let craftAppLink: string | null = null
 // The task whose done button was pressed once and waits for the second press
 let craftArmed: { id: string; until: number } | null = null
 // The last task marked done, so it can be undone
@@ -274,6 +281,13 @@ async function loadCraft($: EngineInterface) {
   $.ui.invalidate('ui.render')
   try {
     craftServer = await findServer($, 'craft_read', CRAFT)
+    if (craftAppLink === null) {
+      try {
+        const info = JSON.parse(mcpText(await $.mcp.call(craftServer, 'craft_read', { command: 'connection info' })))
+        const template = info?.urlTemplates?.app
+        if (typeof template === 'string' && template.startsWith('craftdocs://') && template.includes('{blockId}')) craftAppLink = template
+      } catch {}
+    }
     craftTasks = parseCraftTasks(mcpText(await $.mcp.call(craftServer, 'craft_read', { command: 'tasks list --scope active' })))
     craftState = 'ready'
   } catch (error) {
@@ -289,6 +303,13 @@ async function loadCraft($: EngineInterface) {
 async function setCraftState($: EngineInterface, task: CraftTask, state: 'done' | 'todo') {
   if (!CRAFT_ID.test(task.id)) throw new Error('not a Craft task id')
   mcpText(await $.mcp.call(craftServer, 'craft_write', { command: `tasks update --task ${task.id} --state ${state}` }))
+}
+
+// Open a task in the Craft app; only craftdocs links for a real task id
+async function openCraftTask($: EngineInterface, task: CraftTask) {
+  if (craftAppLink === null) throw new Error('Craft gave no app link')
+  if (!CRAFT_ID.test(task.id)) throw new Error('not a Craft task id')
+  await openLink($, craftAppLink.replace('{blockId}', task.id))
 }
 
 // YYYY-MM-DD for a time, in local time
@@ -893,7 +914,7 @@ export const register: Register = on => {
           }
           const { task, index } = item
           const isArmed = craftArmed?.id === task.id && craftArmed.until >= now
-          const room = columns - (isArmed ? 22 : 16)
+          const room = columns - (isArmed ? 22 : 16) - (craftAppLink !== null ? 8 : 0)
           const label = task.text.length > room ? `${task.text.slice(0, room - 1)}…` : task.text
           const isLate = task.deadline !== '' && task.deadline < today
           return (
@@ -906,6 +927,15 @@ export const register: Register = on => {
                   {...(index < 9 ? { hotkey: String(index + 1) } : {})}
                   onPress={() => void pick(task).catch(() => $.ui.toast('Could not put the task in the prompt.'))}
                 />
+                {craftAppLink !== null && (
+                  <Button
+                    key={`craft-open-${task.id}`}
+                    label="↗ open"
+                    plain
+                    dimColor
+                    onPress={() => void openCraftTask($, task).catch(() => $.ui.toast('Could not open the task in Craft.'))}
+                  />
+                )}
                 <Button
                   key={`craft-done-${task.id}`}
                   label={isArmed ? '✓ press again' : '✓ done'}

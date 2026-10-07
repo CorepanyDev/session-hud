@@ -18,7 +18,14 @@ const setup = (on: Parameters<Parameters<typeof test>[1]>[1]) => {
   mock.clock(on, { now: new Date('2026-10-07T12:00:00').getTime() })
   mock.store(on)
   on('session.usage', () => ({ value: { startedAt: 0, context: { tokens: 0, window: 200000, percent: 0 }, rateLimits: [] } }))
-  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '' } }))
+  const opened: string[] = []
+  on('process.run', (_, e) => {
+    if (e.argv[0] === 'open') {
+      opened.push(e.argv[1] ?? '')
+      return { value: { exitCode: 0, stdout: '', stderr: '' } }
+    }
+    return { value: { exitCode: 1, stdout: '', stderr: '' } }
+  })
   on('ui.panes', () => ({ value: [] }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.toast', () => ({ value: undefined }))
@@ -27,10 +34,15 @@ const setup = (on: Parameters<Parameters<typeof test>[1]>[1]) => {
   on('mcp.call', (_, e) => {
     const command = String(e.args.command ?? '')
     if (e.tool === 'craft_write') writes.push(`${e.server} ${command}`)
-    const text = e.tool === 'craft_read' ? LIST : 'Updated'
+    const text =
+      command === 'connection info'
+        ? JSON.stringify({ urlTemplates: { app: 'craftdocs://open?spaceId=space-1&blockId={blockId}' } })
+        : e.tool === 'craft_read'
+          ? LIST
+          : 'Updated'
     return { value: { content: [{ type: 'text', text }], isError: false } }
   })
-  return writes
+  return { writes, opened }
 }
 
 test('/hud craft groups your Craft tasks by overdue, today and no date', async ($, on) => {
@@ -51,7 +63,7 @@ test('/hud craft groups your Craft tasks by overdue, today and no date', async (
 })
 
 test('marking a Craft task done takes two presses and can be undone', async ($, on) => {
-  const writes = setup(on)
+  const { writes } = setup(on)
   await $.command.run({ command: 'hud', args: 'craft' })
   const pane = await $.ui.mount({ plugin: 'session-hud', surface: 'terminal', component: 'Pane', requestId: 'hud-craft', props: {} })
 
@@ -67,5 +79,14 @@ test('marking a Craft task done takes two presses and can be undone', async ($, 
   await pane.press({ key: 'craft-undo' })
   expect(writes).toEqual([`craft tasks update --task ${id} --state done`, `craft tasks update --task ${id} --state todo`])
   expect(await pane.find({ type: 'Text', text: /3 active/ })).toBeDefined()
+  await pane.unmount()
+})
+
+test('the open button opens a Craft task in the Craft app', async ($, on) => {
+  const { opened } = setup(on)
+  await $.command.run({ command: 'hud', args: 'craft' })
+  const pane = await $.ui.mount({ plugin: 'session-hud', surface: 'terminal', component: 'Pane', requestId: 'hud-craft', props: {} })
+  await pane.press({ key: 'craft-open-11111111-1111-4111-8111-111111111111' })
+  expect(opened).toEqual(['craftdocs://open?spaceId=space-1&blockId=11111111-1111-4111-8111-111111111111'])
   await pane.unmount()
 })
