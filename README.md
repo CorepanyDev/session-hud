@@ -18,6 +18,14 @@ Run `/hud tasks` to open or close a pane with your open ClickUp tasks, grouped b
 
 Run `/hud craft` to open or close a pane with your active Craft tasks, grouped into overdue, today, later and no date. Press **✓ done** twice to mark a task done in Craft (it moves to the logbook); `u` undoes the last one. Clicking a task puts it in your prompt, and ↗ open opens it in the Craft app. It needs the Craft connector; in auto mode, also allow `mcp__<server>__craft_read` and `mcp__<server>__craft_write`.
 
+Run `/hud kpi` to open your personal KPIs: prompts today against a daily goal, prompts per active hour, an hour-by-hour sparkline, this week by day with your share of the weekly limit, your streak of days at goal, and the pace of your weekly and 5-hour limits (where you'll end up by the reset, and how much a day is left to use the rest). Prompts are counted across all your sessions; only prompts you write count, not ones plugins or schedules submit. The band shows `✎ prompts/goal`.
+
+When no session has had a prompt for a while during work hours, a toast nudges you, names your next Craft task and suggests it in the prompt box.
+
+- `/hud goal 40` sets the daily prompt goal (default 30)
+- `/hud idle 45` sets the nudge after 45 idle minutes; `/hud idle off` turns it off (default 30)
+- `/hud hours 9-19` sets work hours, Monday to Friday (default 9-19)
+
 Run `/hud update` to install the latest version from GitHub; it reloads plugins for you.
 
 ## Install

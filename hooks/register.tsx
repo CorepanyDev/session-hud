@@ -23,6 +23,17 @@ const PANE = 'hud-tools'
 const TASKS_PANE = 'hud-tasks'
 const CLICKUP = 'claude.ai Clickup'
 const CRAFT_PANE = 'hud-craft'
+const KPI_PANE = 'hud-kpi'
+
+// One session's record for one day; the pane adds up every session's
+type DayRecord = { prompts: number; hours: number[]; tasksDone: number }
+type Kpis = {
+  today: DayRecord
+  week: { day: string; prompts: number; usage: number | null }[]
+  weeks: number[]
+  streak: number
+}
+type Settings = { goal: number; idleMinutes: number; startHour: number; endHour: number }
 const CRAFT = 'claude.ai Craft'
 
 // One of your active Craft tasks
@@ -221,6 +232,150 @@ async function openTask($: EngineInterface, task: Task) {
   await openLink($, task.url)
 }
 
+const DEFAULT_SETTINGS: Settings = { goal: 30, idleMinutes: 30, startHour: 9, endHour: 19 }
+let settings: Settings = DEFAULT_SETTINGS
+let sessionId = 'session'
+let kpis: Kpis | null = null
+let isTurnRunning = false
+let lastPromptAt = 0
+
+const emptyDay = (): DayRecord => ({ prompts: 0, hours: Array.from({ length: 24 }, () => 0), tasksDone: 0 })
+const dayKey = (day: string) => `kpi:${day}:${sessionId}`
+
+// The days of the week holding a time, Monday first
+const weekDays = (ms: number) => {
+  const day = new Date(ms)
+  const monday = new Date(day.getFullYear(), day.getMonth(), day.getDate() - ((day.getDay() + 6) % 7), 12)
+  return Array.from({ length: 7 }, (_, i) => isoDay(monday.getTime() + i * 24 * HOUR))
+}
+
+// Add to this session's record for today
+async function bumpToday($: EngineInterface, change: (record: DayRecord) => void) {
+  const now = await $.clock.now()
+  const key = dayKey(isoDay(now))
+  const saved = await $.store.get(key)
+  const record = saved !== null && typeof saved === 'object' ? { ...emptyDay(), ...(saved as Partial<DayRecord>) } : emptyDay()
+  change(record)
+  await $.store.set(key, record)
+}
+
+// Keep the highest seven-day reading per day and per window, for the history
+async function recordUsage($: EngineInterface) {
+  try {
+    const usage = await $.session.usage()
+    const week = usage.rateLimits.find(limit => limit.kind === 'seven_day')
+    if (week === undefined) return
+    const today = isoDay(await $.clock.now())
+    const day = await $.store.get(`usage:${today}`)
+    if (typeof day !== 'number' || week.percentUsed > day) await $.store.set(`usage:${today}`, week.percentUsed)
+    if (week.resetsAt !== undefined) {
+      const key = `week:${week.resetsAt.slice(0, 10)}`
+      const best = await $.store.get(key)
+      if (typeof best !== 'number' || week.percentUsed > best) await $.store.set(key, week.percentUsed)
+    }
+  } catch {}
+}
+
+// Add up every session's records: today, this week by day, past weeks and the goal streak
+async function loadKpis($: EngineInterface) {
+  const now = await $.clock.now()
+  const today = isoDay(now)
+  const days = weekDays(now)
+  const byDay = new Map<string, DayRecord>()
+  const keys = await $.store.keys()
+  for (const key of keys) {
+    const match = /^kpi:(\d{4}-\d{2}-\d{2}):/.exec(key)
+    if (match?.[1] === undefined) continue
+    const saved = (await $.store.get(key)) as Partial<DayRecord> | null
+    if (saved === null || typeof saved !== 'object') continue
+    const total = byDay.get(match[1]) ?? emptyDay()
+    total.prompts += saved.prompts ?? 0
+    total.tasksDone += saved.tasksDone ?? 0
+    saved.hours?.forEach((count, hour) => (total.hours[hour] = (total.hours[hour] ?? 0) + count))
+    byDay.set(match[1], total)
+  }
+  // Usage per day: the rise of the seven-day reading since the day before
+  const week = await Promise.all(
+    days.map(async (day, i) => {
+      const reading = await $.store.get(`usage:${day}`)
+      const before = i === 0 ? await $.store.get(`usage:${isoDay(new Date(`${day}T12:00:00`).getTime() - 24 * HOUR)}`) : await $.store.get(`usage:${days[i - 1]}`)
+      const usage = typeof reading === 'number' ? Math.max(0, reading - (typeof before === 'number' && before <= reading ? before : 0)) : null
+      return { day, prompts: byDay.get(day)?.prompts ?? 0, usage: day > today ? null : usage }
+    }),
+  )
+  const weeks: number[] = []
+  for (const key of keys.filter(key => key.startsWith('week:')).sort().slice(-5, -1)) {
+    const value = await $.store.get(key)
+    if (typeof value === 'number') weeks.push(value)
+  }
+  // Days in a row that met the goal, ending today or yesterday
+  let streak = 0
+  for (let i = 0; i < 60; i++) {
+    const day = isoDay(now - i * 24 * HOUR)
+    const prompts = byDay.get(day)?.prompts ?? 0
+    if (prompts >= settings.goal) streak += 1
+    else if (i > 0) break
+  }
+  kpis = { today: byDay.get(today) ?? emptyDay(), week, weeks, streak }
+  $.ui.invalidate('ui.render')
+}
+
+// Forget records older than five weeks
+async function pruneKpis($: EngineInterface) {
+  const oldest = isoDay((await $.clock.now()) - 35 * 24 * HOUR)
+  for (const key of await $.store.keys()) {
+    const day = /^(?:kpi|usage):(\d{4}-\d{2}-\d{2})/.exec(key)?.[1]
+    if (day !== undefined && day < oldest) await $.store.delete(key)
+  }
+}
+
+const isWorkTime = (ms: number) => {
+  const day = new Date(ms)
+  const hour = day.getHours()
+  return day.getDay() >= 1 && day.getDay() <= 5 && hour >= settings.startHour && hour < settings.endHour
+}
+
+// Nudge when nobody prompted in any session for a while during work hours; one session nudges
+async function checkIdle($: EngineInterface) {
+  if (settings.idleMinutes <= 0 || isTurnRunning) return
+  const now = await $.clock.now()
+  if (!isWorkTime(now)) return
+  const shared = await $.store.get('lastPrompt')
+  const last = Math.max(lastPromptAt, typeof shared === 'number' ? shared : 0)
+  const idleMs = settings.idleMinutes * MINUTE
+  const startOfWork = new Date(now).setHours(settings.startHour, 0, 0, 0)
+  if (now - Math.max(last, startOfWork) < idleMs) return
+  const nudged = await $.store.get('idleNudgeAt')
+  if (typeof nudged === 'number' && now - nudged < idleMs) return
+  await $.store.set('idleNudgeAt', now)
+  const idleFor = last > startOfWork ? `No prompt for ${formatLeft(now - last)}` : 'No prompt yet today'
+  const usage = await $.session.usage().catch(() => null)
+  const week = usage?.rateLimits.find(limit => limit.kind === 'seven_day')
+  const pace = week === undefined ? '' : ` · week ${Math.round(week.percentUsed)}% used`
+  const next = craftTasks.find(task => craftGroup(task, isoDay(now)) !== 'later' && craftGroup(task, isoDay(now)) !== 'no date')
+  $.ui.toast(`${idleFor}${pace}.${next !== undefined ? ` Next: ${next.text.slice(0, 60)}` : ''}`)
+  if (next !== undefined) void $.prompt.suggest({ text: `Help me with my Craft task: "${next.text}"` }).catch(() => {})
+}
+
+// Where a limit ends up by its reset at the current rate
+const pace = (percentUsed: number, resetsAt: string | undefined, windowMs: number, now: number) => {
+  if (resetsAt === undefined) return null
+  const left = Math.max(0, new Date(resetsAt).getTime() - now)
+  const elapsed = Math.min(1, Math.max(0.01, 1 - left / windowMs))
+  return { elapsed: elapsed * 100, projected: Math.min(999, percentUsed / elapsed), left }
+}
+
+const formatSpan = (ms: number) => {
+  const hours = Math.floor(ms / HOUR)
+  return hours >= 24 ? `${Math.floor(hours / 24)}d ${hours % 24}h` : hours > 0 ? `${hours}h ${Math.floor((ms % HOUR) / MINUTE)}m` : `${Math.floor(ms / MINUTE)}m`
+}
+
+const SPARK = '▁▂▃▄▅▆▇█'
+const spark = (values: number[]) => {
+  const top = Math.max(1, ...values)
+  return values.map(value => (value === 0 ? '·' : SPARK[Math.min(7, Math.floor((value / top) * 7.999))])).join('')
+}
+
 let craftTasks: CraftTask[] = []
 let craftState: 'never' | 'loading' | 'ready' | 'error' = 'never'
 let craftError = ''
@@ -411,10 +566,15 @@ export const register: Register = on => {
     await $.command.register({
       name: 'hud',
       description:
-        'Show or hide the session HUD band; /hud tools toggles the tool calls pane; /hud tasks your ClickUp tasks; /hud craft your Craft tasks; /hud update installs the latest version',
-      argumentHint: '[tools|tasks|craft|update]',
+        'Show or hide the session HUD band; /hud tools, tasks, craft or kpi toggle a pane; /hud goal <n>, /hud idle <minutes|off>, /hud hours <9-19> set your KPIs; /hud update installs the latest version',
+      argumentHint: '[tools|tasks|craft|kpi|goal n|idle m|hours a-b|update]',
     })
     isHidden = (await $.store.get('isHidden')) === true
+    const saved = await $.store.get('settings')
+    if (saved !== null && typeof saved === 'object') settings = { ...DEFAULT_SETTINGS, ...(saved as Partial<Settings>) }
+    sessionId = await $.session.id().catch(() => 'session')
+    void pruneKpis($).catch(() => {})
+    void recordUsage($)
     void refreshGit($)
     // Keep the cost and context figures fresh
     $.clock.every(5000, async () => {
@@ -422,6 +582,12 @@ export const register: Register = on => {
       // Keep the tasks fresh while their pane is open
       if (tasksState !== 'loading' && (await $.clock.now()) - tasksAt > 5 * MINUTE) {
         if ((await $.ui.panes()).some(pane => pane.id === TASKS_PANE)) void loadTasks($)
+      }
+      const tick = await $.clock.now()
+      if (Math.floor(tick / MINUTE) !== Math.floor((tick - 5000) / MINUTE)) {
+        void checkIdle($).catch(() => {})
+        if ((await $.ui.panes()).some(pane => pane.id === KPI_PANE)) void loadKpis($).catch(() => {})
+        if (Math.floor(tick / MINUTE) % 5 === 0) void recordUsage($)
       }
       if (craftState !== 'loading' && (await $.clock.now()) - craftAt > 5 * MINUTE) {
         if ((await $.ui.panes()).some(pane => pane.id === CRAFT_PANE)) void loadCraft($)
@@ -433,6 +599,37 @@ export const register: Register = on => {
 
   on('command.run', { command: 'hud' }, async ($, e) => {
     if (e.args.trim() === 'update') return updatePlugin($)
+    const [verb = '', value = ''] = e.args.trim().split(/\s+/)
+    if (verb === 'kpi') {
+      const panes = await $.ui.panes()
+      if (panes.some(pane => pane.id === KPI_PANE)) {
+        await $.ui.close({ id: KPI_PANE })
+        return { text: 'KPI pane closed.' }
+      }
+      void loadKpis($).catch(() => {})
+      void recordUsage($)
+      const opened = await $.ui.open({ id: KPI_PANE, title: 'KPIs' })
+      return { text: opened.isPlaced ? 'KPI pane opened.' : 'KPI pane opens once the terminal is wider.' }
+    }
+    if (verb === 'goal' || verb === 'idle' || verb === 'hours') {
+      const next = { ...settings }
+      if (verb === 'goal' && /^\d+$/.test(value) && Number(value) > 0) next.goal = Number(value)
+      else if (verb === 'idle' && (value === 'off' || /^\d+$/.test(value))) next.idleMinutes = value === 'off' ? 0 : Number(value)
+      else if (verb === 'hours' && /^\d{1,2}-\d{1,2}$/.test(value)) {
+        const [start = 9, end = 19] = value.split('-').map(Number)
+        if (start >= end || end > 24) return { text: 'Hours look like 9-19, start before end.' }
+        next.startHour = start
+        next.endHour = end
+      } else {
+        return { text: 'Use /hud goal 40, /hud idle 30 (or off), or /hud hours 9-19.' }
+      }
+      settings = next
+      await $.store.set('settings', settings)
+      void loadKpis($).catch(() => {})
+      return {
+        text: `Daily goal ${settings.goal} prompts · idle nudge ${settings.idleMinutes > 0 ? `after ${settings.idleMinutes}m` : 'off'} · work hours ${settings.startHour}-${settings.endHour}, Mon-Fri.`,
+      }
+    }
     if (e.args.trim() === 'craft') {
       const panes = await $.ui.panes()
       if (panes.some(pane => pane.id === CRAFT_PANE)) {
@@ -470,6 +667,19 @@ export const register: Register = on => {
 
   on('prompt.submit', async ($, e, next) => {
     turnStartedAt = await $.clock.now()
+    isTurnRunning = true
+    // Count what you wrote: typed here, in the Desktop app or from Remote Control
+    if (['composer', 'sdk', 'bridge'].includes(e.origin.kind)) {
+      lastPromptAt = turnStartedAt
+      const hour = new Date(turnStartedAt).getHours()
+      void bumpToday($, record => {
+        record.prompts += 1
+        record.hours[hour] = (record.hours[hour] ?? 0) + 1
+      })
+        .then(() => $.store.set('lastPrompt', turnStartedAt))
+        .then(() => loadKpis($))
+        .catch(() => {})
+    }
     return next(e)
   }).catch(($, e, next) => next(e))
 
@@ -534,6 +744,7 @@ export const register: Register = on => {
       void refreshAgents($)
       return next(e)
     }
+    isTurnRunning = false
     if (turnStartedAt > 0) {
       lastTurnSeconds = Math.round(((await $.clock.now()) - turnStartedAt) / 1000)
     }
@@ -580,6 +791,15 @@ export const register: Register = on => {
           </Text>
         )}
         {git !== null && sep}
+        {kpis !== null && (
+          <Text>
+            <Text dimColor>✎ </Text>
+            <Text color={kpis.today.prompts >= settings.goal ? 'green' : undefined}>
+              {kpis.today.prompts}/{settings.goal}
+            </Text>
+          </Text>
+        )}
+        {kpis !== null && sep}
         <Text>
           <Text dimColor>ctx </Text>
           {percent === undefined ? (
@@ -837,6 +1057,7 @@ export const register: Register = on => {
       await setCraftState($, task, 'done')
       craftTasks = craftTasks.filter(one => one.id !== task.id)
       craftLastDone = task
+      void bumpToday($, record => (record.tasksDone += 1)).then(() => loadKpis($)).catch(() => {})
       $.ui.toast(`Done: ${task.text.slice(0, 60)}`)
       redraw()
     }
@@ -846,6 +1067,7 @@ export const register: Register = on => {
       if (task === null) return
       await setCraftState($, task, 'todo')
       craftLastDone = null
+      void bumpToday($, record => (record.tasksDone = Math.max(0, record.tasksDone - 1))).then(() => loadKpis($)).catch(() => {})
       craftTasks = [task, ...craftTasks]
       $.ui.toast(`Back to do: ${task.text.slice(0, 60)}`)
       redraw()
@@ -956,6 +1178,129 @@ export const register: Register = on => {
           )
         })}
         {hidden > 0 && <Text dimColor>+{hidden} more tasks not shown (pane too short)</Text>}
+      </Box>
+    )
+  })
+
+  on('ui.render', { component: 'Pane', requestId: KPI_PANE }, async ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
+    const now = await $.clock.now()
+    if (kpis === null) return <Text dimColor>Adding up your KPIs…</Text>
+    const today = kpis.today
+    const activeHours = today.hours.filter(count => count > 0).length
+    const perHour = activeHours > 0 ? today.prompts / activeHours : 0
+    const hoursShown = today.hours.slice(settings.startHour - 1 < 0 ? 0 : settings.startHour - 1, Math.min(24, settings.endHour + 2))
+    const firstHour = settings.startHour - 1 < 0 ? 0 : settings.startHour - 1
+    const shared = await $.store.get('lastPrompt')
+    const last = Math.max(lastPromptAt, typeof shared === 'number' ? shared : 0)
+    const weekTotal = kpis.week.reduce((sum, day) => sum + day.prompts, 0)
+    const daysSoFar = kpis.week.filter(day => day.day <= isoDay(now)).length
+    const weekTasks = kpis.today.tasksDone
+
+    const usage = await $.session.usage().catch(() => null)
+    const seven = usage?.rateLimits.find(limit => limit.kind === 'seven_day')
+    const five = usage?.rateLimits.find(limit => limit.kind === 'five_hour')
+    const sevenPace = seven === undefined ? null : pace(seven.percentUsed, seven.resetsAt, 7 * 24 * HOUR, now)
+    const fivePace = five === undefined ? null : pace(five.percentUsed, five.resetsAt, 5 * HOUR, now)
+    const daysLeft = sevenPace === null ? 0 : sevenPace.left / (24 * HOUR)
+    const perDay = seven === undefined || daysLeft <= 0 ? 0 : (100 - seven.percentUsed) / Math.max(1, daysLeft)
+
+    const paceLine = (used: number, p: { elapsed: number; projected: number }) => {
+      const ahead = used > p.elapsed
+      return (
+        <Text>
+          <Text dimColor>  pace   </Text>
+          <Text color={p.projected >= 100 ? (ahead ? 'yellow' : 'green') : 'cyan'}>
+            {p.projected >= 100 ? 'on track to use it all' : `~${Math.round(p.projected)}% by reset, ${100 - Math.round(p.projected)}% unused`}
+          </Text>
+          <Text dimColor> · {ahead ? '▲ ahead of' : '▼ behind'} an even pace</Text>
+        </Text>
+      )
+    }
+
+    return (
+      <Box flexDirection="column">
+        <Text bold color="cyan">Today</Text>
+        <Text>
+          <Text dimColor>  prompts </Text>
+          <Text color={today.prompts >= settings.goal ? 'green' : undefined}>
+            {meter((today.prompts / settings.goal) * 100)} {today.prompts}/{settings.goal}
+          </Text>
+          <Text dimColor> · {perHour.toFixed(1)} per active hour · {activeHours}h active</Text>
+        </Text>
+        <Text>
+          <Text dimColor>  hours   </Text>
+          {spark(hoursShown)}
+          <Text dimColor> {firstHour}:00–{firstHour + hoursShown.length}:00</Text>
+        </Text>
+        <Text>
+          <Text dimColor>  last    </Text>
+          {last > 0 ? `${formatSpan(now - last)} ago` : 'no prompt yet'}
+          <Text dimColor> · nudge {settings.idleMinutes > 0 ? `after ${settings.idleMinutes}m idle, ${settings.startHour}-${settings.endHour} Mon-Fri` : 'off'}</Text>
+        </Text>
+        {weekTasks > 0 && (
+          <Text>
+            <Text dimColor>  done    </Text>
+            {weekTasks} Craft task{weekTasks === 1 ? '' : 's'}
+          </Text>
+        )}
+
+        <Text bold color="cyan">This week</Text>
+        <Text>
+          <Text dimColor>  prompts </Text>
+          {weekTotal}
+          <Text dimColor> · {(weekTotal / Math.max(1, daysSoFar)).toFixed(0)} a day · streak {kpis.streak} day{kpis.streak === 1 ? '' : 's'} at goal</Text>
+        </Text>
+        {kpis.week.map(day => (
+          <Text>
+            <Text dimColor>  {new Date(`${day.day}T12:00:00`).toLocaleDateString('en-US', { weekday: 'short' })} </Text>
+            <Text color={day.day === isoDay(now) ? 'green' : undefined}>
+              {'▇'.repeat(Math.min(20, Math.round((day.prompts / Math.max(1, settings.goal)) * 10)))}
+            </Text>
+            <Text dimColor>
+              {' '}
+              {day.day > isoDay(now) ? '' : `${day.prompts}`}
+              {day.usage !== null ? ` · ${Math.round(day.usage)}% of week` : ''}
+            </Text>
+          </Text>
+        ))}
+
+        {seven !== undefined && sevenPace !== null && (
+          <Box flexDirection="column">
+            <Text bold color="cyan">
+              Weekly limit <Text dimColor>· resets in {formatSpan(sevenPace.left)}</Text>
+            </Text>
+            <Text>
+              <Text dimColor>  used   </Text>
+              <Text color={levelColor(seven.percentUsed)}>{meter(seven.percentUsed)} {Math.round(seven.percentUsed)}%</Text>
+              <Text dimColor> · week {Math.round(sevenPace.elapsed)}% gone</Text>
+            </Text>
+            {paceLine(seven.percentUsed, sevenPace)}
+            <Text>
+              <Text dimColor>  budget </Text>
+              {perDay.toFixed(0)}% a day to use the rest
+            </Text>
+          </Box>
+        )}
+        {five !== undefined && fivePace !== null && (
+          <Box flexDirection="column">
+            <Text bold color="cyan">
+              5-hour limit <Text dimColor>· resets in {formatSpan(fivePace.left)}</Text>
+            </Text>
+            <Text>
+              <Text dimColor>  used   </Text>
+              <Text color={levelColor(five.percentUsed)}>{meter(five.percentUsed)} {Math.round(five.percentUsed)}%</Text>
+              <Text dimColor> · window {Math.round(fivePace.elapsed)}% gone</Text>
+            </Text>
+            {paceLine(five.percentUsed, fivePace)}
+          </Box>
+        )}
+        {kpis.weeks.length > 0 && (
+          <Text>
+            <Text dimColor>  past weeks </Text>
+            {kpis.weeks.map(value => `${Math.round(value)}%`).join(' · ')}
+          </Text>
+        )}
       </Box>
     )
   })
