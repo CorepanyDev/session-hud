@@ -1,0 +1,6 @@
+{
+  "name": "session-hud",
+  "description": "A HUD band above the Claude Code prompt",
+  "owner": { "name": "Cemal Sert" },
+  "plugins": [{ "name": "session-hud", "source": "./" }]
+}
