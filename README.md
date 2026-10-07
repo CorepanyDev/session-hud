@@ -20,11 +20,12 @@ Run `/hud craft` to open or close a pane with your active Craft tasks, grouped i
 
 Run `/hud kpi` to open your personal KPIs: prompts today against a daily goal, prompts per active hour, an hour-by-hour sparkline, this week by day with your share of the weekly limit, your streak of days at goal, and the pace of your weekly and 5-hour limits (where you'll end up by the reset, and how much a day is left to use the rest). Prompts are counted across all your sessions; only prompts you write count, not ones plugins or schedules submit. The band shows `✎ prompts/goal`.
 
-When no session has had a prompt for a while during work hours, a toast nudges you, names your next Craft task and suggests it in the prompt box.
+When no session has had a prompt for a while during work hours, a toast and a soft chime nudge you; the toast names your next Craft task and suggests it in the prompt box.
 
 - `/hud goal 40` sets the daily prompt goal (default 30)
 - `/hud idle 45` sets the nudge after 45 idle minutes; `/hud idle off` turns it off (default 30)
 - `/hud hours 9-19` sets work hours, Monday to Friday (default 9-19)
+- `/hud sound off` silences the nudge's chime, `/hud sound on` brings it back, `/hud sound test` plays it (macOS)
 
 Run `/hud next` for next-prompt suggestions. It reads the tail of your 10 most recently active sessions' transcripts (`~/.claude/projects`), keeps only the prompts you wrote and Claude's last reply, and asks Sonnet for the 3 to 5 most useful next prompts. Press a number to put one in your prompt; one from another project names its folder. Suggestions are kept for two hours (`r` makes new ones), and the idle nudge suggests the top one. Making suggestions spends a model call from your plan.
 

@@ -39,7 +39,7 @@ type Kpis = {
   weeks: number[]
   streak: number
 }
-type Settings = { goal: number; idleMinutes: number; startHour: number; endHour: number }
+type Settings = { goal: number; idleMinutes: number; startHour: number; endHour: number; sound: boolean }
 const CRAFT = 'claude.ai Craft'
 
 // One of your active Craft tasks
@@ -238,7 +238,9 @@ async function openTask($: EngineInterface, task: Task) {
   await openLink($, task.url)
 }
 
-const DEFAULT_SETTINGS: Settings = { goal: 30, idleMinutes: 30, startHour: 9, endHour: 19 }
+const DEFAULT_SETTINGS: Settings = { goal: 30, idleMinutes: 30, startHour: 9, endHour: 19, sound: true }
+
+const chime = ($: EngineInterface) => $.audio.play({ asset: 'sounds/chime.wav' }, { gain: 0.8 })
 let settings: Settings = DEFAULT_SETTINGS
 let sessionId = 'session'
 let kpis: Kpis | null = null
@@ -362,6 +364,7 @@ async function checkIdle($: EngineInterface) {
   const next = craftTasks.find(task => craftGroup(task, isoDay(now)) !== 'later' && craftGroup(task, isoDay(now)) !== 'no date')
   const hint = idea !== undefined ? `${idea.project}: ${idea.prompt}` : next !== undefined ? next.text : ''
   $.ui.toast(`${idleFor}${pace}.${hint !== '' ? ` Next: ${hint.slice(0, 70)}` : ''}`)
+  if (settings.sound) void chime($).catch(() => {})
   const text = idea !== undefined ? idea.prompt : next !== undefined ? `Help me with my Craft task: "${next.text}"` : ''
   if (text !== '') void $.prompt.suggest({ text }).catch(() => {})
 }
@@ -691,7 +694,7 @@ export const register: Register = on => {
       name: 'hud',
       description:
         'Show or hide the session HUD band; /hud tools, tasks, craft, kpi or next toggle a pane; /hud goal <n>, /hud idle <minutes|off>, /hud hours <9-19> set your KPIs; /hud update installs the latest version',
-      argumentHint: '[tools|tasks|craft|kpi|next|goal n|idle m|hours a-b|update]',
+      argumentHint: '[tools|tasks|craft|kpi|next|goal n|idle m|hours a-b|sound on/off/test|update]',
     })
     isHidden = (await $.store.get('isHidden')) === true
     const saved = await $.store.get('settings')
@@ -752,6 +755,16 @@ export const register: Register = on => {
       const opened = await $.ui.open({ id: KPI_PANE, title: 'KPIs' })
       return { text: opened.isPlaced ? 'KPI pane opened.' : 'KPI pane opens once the terminal is wider.' }
     }
+    if (verb === 'sound') {
+      if (value === 'test') {
+        await chime($).catch(() => $.ui.toast('This terminal cannot play sounds.'))
+        return { text: 'Played the nudge chime.' }
+      }
+      if (value !== 'on' && value !== 'off') return { text: 'Use /hud sound on, off or test.' }
+      settings = { ...settings, sound: value === 'on' }
+      await $.store.set('settings', settings)
+      return { text: `Nudge chime ${value}.` }
+    }
     if (verb === 'goal' || verb === 'idle' || verb === 'hours') {
       const next = { ...settings }
       if (verb === 'goal' && /^\d+$/.test(value) && Number(value) > 0) next.goal = Number(value)
@@ -768,7 +781,7 @@ export const register: Register = on => {
       await $.store.set('settings', settings)
       void loadKpis($).catch(() => {})
       return {
-        text: `Daily goal ${settings.goal} prompts · idle nudge ${settings.idleMinutes > 0 ? `after ${settings.idleMinutes}m` : 'off'} · work hours ${settings.startHour}-${settings.endHour}, Mon-Fri.`,
+        text: `Daily goal ${settings.goal} prompts · idle nudge ${settings.idleMinutes > 0 ? `after ${settings.idleMinutes}m${settings.sound ? ' with a chime' : ''}` : 'off'} · work hours ${settings.startHour}-${settings.endHour}, Mon-Fri.`,
       }
     }
     if (e.args.trim() === 'craft') {

@@ -20,12 +20,17 @@ const setup = (on: Parameters<Parameters<typeof test>[1]>[1], now = WEDNESDAY_10
   on('prompt.submit', (_, e) => ({ text: e.text }))
   on('prompt.suggest', () => ({ isShown: true }))
   on('turn.complete', (_, e) => ({ text: e.text }))
+  const sounds: string[] = []
+  on('audio.play', (_, e) => {
+    sounds.push(JSON.stringify(e).includes('sounds/chime.wav') ? 'sounds/chime.wav' : JSON.stringify(e))
+    return { value: undefined }
+  })
   const toasts: string[] = []
   on('ui.toast', (_, e) => {
     toasts.push(String(e.text))
     return { value: undefined }
   })
-  return { clock, toasts }
+  return { clock, toasts, sounds }
 }
 
 test('your typed prompts count toward the daily goal; plugin prompts do not', async ($, on) => {
@@ -54,7 +59,7 @@ test('/hud goal, idle and hours change the settings and say so', async ($, on) =
 })
 
 test('a quiet half hour in work hours brings one nudge, not one per minute', async ($, on) => {
-  const { clock, toasts } = setup(on)
+  const { clock, toasts, sounds } = setup(on)
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   await $.session.start({ cwd: '/tmp', surface: 'terminal' })
@@ -67,6 +72,7 @@ test('a quiet half hour in work hours brings one nudge, not one per minute', asy
 
   await clock.advance(11 * 60_000)
   expect(toasts.filter(text => /No prompt for/.test(text)).length).toBe(1)
+  expect(sounds).toEqual(['sounds/chime.wav'])
 
   await clock.advance(5 * 60_000)
   expect(toasts.filter(text => /No prompt for/.test(text)).length).toBe(1)
@@ -79,4 +85,14 @@ test('no nudge outside work hours', async ($, on) => {
   await $.session.start({ cwd: '/tmp', surface: 'terminal' })
   await clock.advance(90 * 60_000)
   expect(toasts.filter(text => /No prompt/.test(text))).toEqual([])
+})
+
+test('/hud sound turns the nudge chime off and on, and test plays it', async ($, on) => {
+  const { sounds } = setup(on)
+  expect((await $.command.run({ command: 'hud', args: 'sound test' })).text).toMatch(/Played/)
+  expect(sounds).toEqual(['sounds/chime.wav'])
+  expect((await $.command.run({ command: 'hud', args: 'sound off' })).text).toMatch(/chime off/)
+  expect((await $.command.run({ command: 'hud', args: 'goal 30' })).text).not.toMatch(/with a chime/)
+  expect((await $.command.run({ command: 'hud', args: 'sound on' })).text).toMatch(/chime on/)
+  expect((await $.command.run({ command: 'hud', args: 'goal 30' })).text).toMatch(/with a chime/)
 })
