@@ -96,3 +96,32 @@ test('/hud sound turns the nudge chime off and on, and test plays it', async ($,
   expect((await $.command.run({ command: 'hud', args: 'sound on' })).text).toMatch(/chime on/)
   expect((await $.command.run({ command: 'hud', args: 'goal 30' })).text).toMatch(/with a chime/)
 })
+
+test('skills you type and skills Claude calls are counted and ranked in the KPIs', async ($, on) => {
+  // Claude's Skill tool call stays open while its skill expands, as in a session
+  let release = () => {}
+  on('tool.call', async () => {
+    await new Promise<void>(resolve => (release = resolve))
+    return { result: { text: 'ok' } }
+  })
+  setup(on)
+  on('session.messages', () => ({ value: [] }))
+  on('skill.prompt', (_, e) => ({ text: e.text }))
+
+  for (const id of ['k1', 'k2']) {
+    const call = $.tool.call({ tool: 'Skill', tool_use_id: id, skill: 'review' })
+    await new Promise(resolve => setTimeout(resolve, 10))
+    await $.skill.prompt({ skill: 'review', text: 'Review it' })
+    release()
+    await call
+  }
+  await $.skill.prompt({ skill: 'commit', text: 'Commit it' })
+
+  await $.command.run({ command: 'hud', args: 'kpi' })
+  const pane = await $.ui.mount({ plugin: 'session-hud', surface: 'terminal', component: 'Pane', requestId: 'hud-kpi', props: {} })
+  expect(await pane.find({ type: 'Text', text: /Top skills/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /\(Claude 2\)/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /\(you 1\)/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /30 days: review 2 · commit 1/ })).toBeDefined()
+  await pane.unmount()
+})

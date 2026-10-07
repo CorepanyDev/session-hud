@@ -51,9 +51,14 @@ type Suggestion = { project: string; cwd: string; prompt: string; why: string }
 type Digest = { project: string; cwd: string; branch: string; title: string; at: number; prompts: string[]; reply: string }
 
 // One session's record for one day; the pane adds up every session's
-type DayRecord = { prompts: number; hours: number[]; tasksDone: number; focus: number }
+// skills: per skill name, how often you typed /name and how often Claude called it
+type SkillCount = { you: number; claude: number }
+type DayRecord = { prompts: number; hours: number[]; tasksDone: number; focus: number; skills: Record<string, SkillCount> }
 type Kpis = {
   today: DayRecord
+  // Skills ranked by use: this week, and the last 30 days
+  skillsWeek: [string, SkillCount][]
+  skillsMonth: [string, SkillCount][]
   week: { day: string; prompts: number; usage: number | null }[]
   weeks: number[]
   streak: number
@@ -266,7 +271,7 @@ let kpis: Kpis | null = null
 let isTurnRunning = false
 let lastPromptAt = 0
 
-const emptyDay = (): DayRecord => ({ prompts: 0, hours: Array.from({ length: 24 }, () => 0), tasksDone: 0, focus: 0 })
+const emptyDay = (): DayRecord => ({ prompts: 0, hours: Array.from({ length: 24 }, () => 0), tasksDone: 0, focus: 0, skills: {} })
 const dayKey = (day: string) => `kpi:${day}:${sessionId}`
 
 // The days of the week holding a time, Monday first
@@ -282,6 +287,7 @@ async function bumpToday($: EngineInterface, change: (record: DayRecord) => void
   const key = dayKey(isoDay(now))
   const saved = await $.store.get(key)
   const record = saved !== null && typeof saved === 'object' ? { ...emptyDay(), ...(saved as Partial<DayRecord>) } : emptyDay()
+  record.skills = { ...(record.skills ?? {}) }
   change(record)
   await $.store.set(key, record)
 }
@@ -319,6 +325,11 @@ async function loadKpis($: EngineInterface) {
     total.prompts += saved.prompts ?? 0
     total.tasksDone += saved.tasksDone ?? 0
     total.focus += saved.focus ?? 0
+    for (const [name, count] of Object.entries(saved.skills ?? {})) {
+      const into = (total.skills[name] ??= { you: 0, claude: 0 })
+      into.you += count.you ?? 0
+      into.claude += count.claude ?? 0
+    }
     saved.hours?.forEach((count, hour) => (total.hours[hour] = (total.hours[hour] ?? 0) + count))
     byDay.set(match[1], total)
   }
@@ -344,7 +355,26 @@ async function loadKpis($: EngineInterface) {
     if (prompts >= settings.goal) streak += 1
     else if (i > 0) break
   }
-  kpis = { today: byDay.get(today) ?? emptyDay(), week, weeks, streak }
+  // Skills over a span of days, most used first
+  const rank = (from: string) => {
+    const totals = new Map<string, SkillCount>()
+    for (const [day, record] of byDay) {
+      if (day < from || day > today) continue
+      for (const [name, count] of Object.entries(record.skills)) {
+        const into = totals.get(name) ?? { you: 0, claude: 0 }
+        totals.set(name, { you: into.you + count.you, claude: into.claude + count.claude })
+      }
+    }
+    return [...totals].sort((a, b) => b[1].you + b[1].claude - (a[1].you + a[1].claude) || a[0].localeCompare(b[0]))
+  }
+  kpis = {
+    today: byDay.get(today) ?? emptyDay(),
+    skillsWeek: rank(days[0] ?? today),
+    skillsMonth: rank(isoDay(now - 29 * 24 * HOUR)),
+    week,
+    weeks,
+    streak,
+  }
   $.ui.invalidate('ui.render')
 }
 
@@ -1224,6 +1254,13 @@ export const register: Register = on => {
     const viaTool = calls.find(
       call => call.tool === 'Skill' && call.state === 'running' && (call.target === name || call.target.endsWith(`:${name}`)),
     )
+    const by = viaTool !== undefined ? 'claude' : 'you'
+    void bumpToday($, record => {
+      const count = (record.skills[name] ??= { you: 0, claude: 0 })
+      count[by] += 1
+    })
+      .then(() => loadKpis($))
+      .catch(() => {})
     if (viaTool !== undefined) {
       setCall($, viaTool.id, { by: 'claude' })
     } else {
@@ -1784,6 +1821,35 @@ export const register: Register = on => {
             </Text>
           </Text>
         ))}
+
+        <Text bold color="cyan">
+          Top skills <Text dimColor>· this week</Text>
+        </Text>
+        {kpis.skillsWeek.length === 0 && <Text dimColor>  No skills used this week yet.</Text>}
+        {kpis.skillsWeek.slice(0, 5).map(([name, count]) => {
+          const total = count.you + count.claude
+          const top = (kpis?.skillsWeek[0]?.[1].you ?? 0) + (kpis?.skillsWeek[0]?.[1].claude ?? 0)
+          return (
+            <Text wrap="truncate-end">
+              <Text>  {name.length > 24 ? `${name.slice(0, 23)}…` : name.padEnd(24)}</Text>
+              <Text color="magenta">{'▇'.repeat(Math.max(1, Math.round((total / Math.max(1, top)) * 10)))}</Text>
+              <Text> {total}</Text>
+              <Text dimColor>
+                {' '}
+                ({[count.you > 0 ? `you ${count.you}` : '', count.claude > 0 ? `Claude ${count.claude}` : ''].filter(part => part !== '').join(' · ')})
+              </Text>
+            </Text>
+          )
+        })}
+        {kpis.skillsMonth.length > 0 && (
+          <Text dimColor wrap="truncate-end">
+            {'  30 days: '}
+            {kpis.skillsMonth
+              .slice(0, 6)
+              .map(([name, count]) => `${name} ${count.you + count.claude}`)
+              .join(' · ')}
+          </Text>
+        )}
 
         {seven !== undefined && sevenPace !== null && (
           <Box flexDirection="column">
