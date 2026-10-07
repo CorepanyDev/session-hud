@@ -693,8 +693,8 @@ export const register: Register = on => {
     await $.command.register({
       name: 'hud',
       description:
-        'Show or hide the session HUD band; /hud tools, tasks, craft, kpi or next toggle a pane; /hud goal <n>, /hud idle <minutes|off>, /hud hours <9-19> set your KPIs; /hud update installs the latest version',
-      argumentHint: '[tools|tasks|craft|kpi|next|goal n|idle m|hours a-b|sound on/off/test|update]',
+        'Show or hide the session HUD band; /hud tools, tasks, craft, kpi or next toggle a pane, /hud all every pane; /hud goal <n>, /hud idle <minutes|off>, /hud hours <9-19> set your KPIs; /hud update installs the latest version',
+      argumentHint: '[all|tools|tasks|craft|kpi|next|goal n|idle m|hours a-b|sound on/off/test|update]',
     })
     isHidden = (await $.store.get('isHidden')) === true
     const saved = await $.store.get('settings')
@@ -733,6 +733,33 @@ export const register: Register = on => {
   on('command.run', { command: 'hud' }, async ($, e) => {
     if (e.args.trim() === 'update') return updatePlugin($)
     const [verb = '', value = ''] = e.args.trim().split(/\s+/)
+    // Every pane at once: open the ones that are closed, or close them all when all are open
+    if (verb === 'all') {
+      const panes: { id: string; title: string; load?: () => void }[] = [
+        { id: PANE, title: 'Tool calls' },
+        { id: TASKS_PANE, title: 'Tasks', load: () => void loadTasks($) },
+        { id: CRAFT_PANE, title: 'Craft', load: () => void loadCraft($) },
+        { id: KPI_PANE, title: 'KPIs', load: () => void loadKpis($).catch(() => {}) },
+        {
+          id: NEXT_PANE,
+          title: 'Next',
+          load: () => {
+            if (suggestState !== 'loading' && suggestState !== 'ready') void loadSuggestions($)
+          },
+        },
+      ]
+      const open = new Set((await $.ui.panes()).map(pane => pane.id))
+      const closed = panes.filter(pane => !open.has(pane.id))
+      if (closed.length === 0) {
+        for (const pane of panes) await $.ui.close({ id: pane.id })
+        return { text: 'All HUD panes closed.' }
+      }
+      for (const pane of closed) {
+        pane.load?.()
+        await $.ui.open({ id: pane.id, title: pane.title })
+      }
+      return { text: `Opened ${closed.map(pane => pane.title).join(', ')}. Run /hud all again to close them all.` }
+    }
     if (verb === 'next') {
       const panes = await $.ui.panes()
       if (panes.some(pane => pane.id === NEXT_PANE)) {

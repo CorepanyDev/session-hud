@@ -1,4 +1,4 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 
 test('/hud tools opens a pane listing each tool call with its reason', async ($, on) => {
   on('session.usage', () => ({ value: {
@@ -64,4 +64,34 @@ test('/hud update installs the newest version and reloads plugins', async ($, on
   expect(reply.text).not.toMatch(/\.\./)
   expect(ran).toContain('claude plugin marketplace update session-hud')
   expect(ran).toContain('claude plugin update session-hud@session-hud')
+})
+
+test('/hud all opens the closed panes, and closes them all when all are open', async ($, on) => {
+  mock.clock(on, { now: 0 })
+  on('session.usage', () => ({ value: { startedAt: 0, context: { tokens: 0, window: 200000, percent: 0 }, rateLimits: [] } }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '' } }))
+  on('store.get', () => ({ value: undefined }))
+  on('store.set', () => ({ value: undefined }))
+  on('store.keys', () => ({ value: [] }))
+  on('tool.list', () => ({ value: [] }))
+  on('mcp.call', () => ({ value: { content: [{ type: 'text', text: 'not connected' }], isError: true } }))
+  on('env.get', () => ({ value: undefined }))
+  const open = new Set<string>(['hud-tools'])
+  on('ui.panes', () => ({ value: [...open].map(id => ({ id, title: id, isShown: true, isFocused: false, isPlaced: true })) }))
+  on('ui.open', (_, e) => {
+    open.add(e.id)
+    return { value: { isPlaced: true } }
+  })
+  on('ui.close', (_, e) => {
+    open.delete(e.id)
+    return { value: undefined }
+  })
+
+  const opened = await $.command.run({ command: 'hud', args: 'all' })
+  expect(opened.text).toBe('Opened Tasks, Craft, KPIs, Next. Run /hud all again to close them all.')
+  expect([...open].sort()).toEqual(['hud-craft', 'hud-kpi', 'hud-next', 'hud-tasks', 'hud-tools'])
+
+  const closed = await $.command.run({ command: 'hud', args: 'all' })
+  expect(closed.text).toBe('All HUD panes closed.')
+  expect([...open]).toEqual([])
 })

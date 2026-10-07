@@ -12,6 +12,8 @@ A HUD band above the Claude Code prompt showing:
 
 Run `/hud` to hide or show it.
 
+Run `/hud all` to open every pane at once (Tool calls, Tasks, Craft, KPIs, Next), or to close them all when they are all open.
+
 Run `/hud tools` to open or close a side pane listing every tool call in the session: the tool, what it worked on, whether it succeeded, and the model's reason (the last line it wrote before the call). Calls are grouped by tool, and skills are listed under Skills, whether Claude used one or you typed `/name`. Each subagent gets its own lane with its type, its task, whether it's still running, and its calls.
 
 Run `/hud tasks` to open or close a pane with your open ClickUp tasks, grouped by status with priority and due date. Press a task's number (or click it) to put it in your prompt, or click ↗ open to open it in your browser. It needs the ClickUp connector (in auto mode, such as the Desktop app, also allow `mcp__<server>__clickup_filter_tasks` and `mcp__<server>__clickup_resolve_assignees` in `permissions.allow`; the pane names the rules to add), refreshes every 5 minutes while open, and `r` refreshes it now.
