@@ -24,6 +24,12 @@ const TASKS_PANE = 'hud-tasks'
 const CLICKUP = 'claude.ai Clickup'
 const CRAFT_PANE = 'hud-craft'
 const KPI_PANE = 'hud-kpi'
+const NEXT_PANE = 'hud-next'
+
+// A next prompt worth sending, suggested from your recent sessions
+type Suggestion = { project: string; cwd: string; prompt: string; why: string }
+// What one recent session was about, read from its transcript's tail
+type Digest = { project: string; cwd: string; branch: string; title: string; at: number; prompts: string[]; reply: string }
 
 // One session's record for one day; the pane adds up every session's
 type DayRecord = { prompts: number; hours: number[]; tasksDone: number }
@@ -352,9 +358,12 @@ async function checkIdle($: EngineInterface) {
   const usage = await $.session.usage().catch(() => null)
   const week = usage?.rateLimits.find(limit => limit.kind === 'seven_day')
   const pace = week === undefined ? '' : ` · week ${Math.round(week.percentUsed)}% used`
+  const idea = suggestions[0]
   const next = craftTasks.find(task => craftGroup(task, isoDay(now)) !== 'later' && craftGroup(task, isoDay(now)) !== 'no date')
-  $.ui.toast(`${idleFor}${pace}.${next !== undefined ? ` Next: ${next.text.slice(0, 60)}` : ''}`)
-  if (next !== undefined) void $.prompt.suggest({ text: `Help me with my Craft task: "${next.text}"` }).catch(() => {})
+  const hint = idea !== undefined ? `${idea.project}: ${idea.prompt}` : next !== undefined ? next.text : ''
+  $.ui.toast(`${idleFor}${pace}.${hint !== '' ? ` Next: ${hint.slice(0, 70)}` : ''}`)
+  const text = idea !== undefined ? idea.prompt : next !== undefined ? `Help me with my Craft task: "${next.text}"` : ''
+  if (text !== '') void $.prompt.suggest({ text }).catch(() => {})
 }
 
 // Where a limit ends up by its reset at the current rate
@@ -374,6 +383,121 @@ const SPARK = '▁▂▃▄▅▆▇█'
 const spark = (values: number[]) => {
   const top = Math.max(1, ...values)
   return values.map(value => (value === 0 ? '·' : SPARK[Math.min(7, Math.floor((value / top) * 7.999))])).join('')
+}
+
+let suggestions: Suggestion[] = []
+let suggestState: 'never' | 'loading' | 'ready' | 'error' = 'never'
+let suggestError = ''
+let suggestAt = 0
+
+// A user message's own words, or '' for tool results, reminders and command wrappers
+const promptText = (content: unknown) => {
+  const text =
+    typeof content === 'string'
+      ? content
+      : Array.isArray(content)
+        ? content.map(block => (block?.type === 'text' && typeof block.text === 'string' ? block.text : '')).join('\n')
+        : ''
+  const clean = text.trim()
+  return clean === '' || clean.startsWith('<') ? '' : oneLine(clean)
+}
+
+// The tail of one transcript, digested: your last prompts and the last reply
+async function digestSession($: EngineInterface, path: string, at: number): Promise<Digest | null> {
+  const tail = await $.process.run(['tail', '-c', '600000', path], { timeoutMs: 10000 })
+  if (tail.exitCode !== 0) return null
+  const digest: Digest = { project: '', cwd: '', branch: '', title: '', at, prompts: [], reply: '' }
+  for (const line of tail.stdout.split('\n').slice(1)) {
+    let entry: Record<string, unknown>
+    try {
+      entry = JSON.parse(line) as Record<string, unknown>
+    } catch {
+      continue
+    }
+    if (typeof entry.cwd === 'string') digest.cwd = entry.cwd
+    if (typeof entry.gitBranch === 'string') digest.branch = entry.gitBranch
+    if (entry.type === 'custom-title' && typeof entry.customTitle === 'string') digest.title = entry.customTitle
+    if (entry.isSidechain === true) continue
+    const message = entry.message as { content?: unknown } | undefined
+    // Only what you wrote: skill text, command wrappers and agents' messages carry no human origin
+    if (entry.type === 'user' && (entry.origin as { kind?: string } | undefined)?.kind === 'human') {
+      const text = promptText(message?.content)
+      if (text !== '') digest.prompts.push(text.slice(0, 300))
+    }
+    if (entry.type === 'assistant' && Array.isArray(message?.content)) {
+      const text = message.content
+        .map(block => (block?.type === 'text' && typeof block.text === 'string' ? block.text : ''))
+        .join(' ')
+        .trim()
+      if (text !== '') digest.reply = oneLine(text).slice(0, 700)
+    }
+  }
+  digest.prompts = digest.prompts.slice(-4)
+  digest.project = digest.cwd.split('/').filter(part => part !== '').at(-1) ?? ''
+  return digest.prompts.length > 0 ? digest : null
+}
+
+// Your ten most recently active sessions, newest first
+async function recentSessions($: EngineInterface) {
+  const home = await $.env.get('HOME')
+  if (home === undefined) throw new Error('no home folder')
+  const root = `${home}/.claude/projects`
+  const files: { path: string; at: number }[] = []
+  for (const folder of await $.fs.list(root)) {
+    if (folder.kind !== 'dir') continue
+    for (const file of await $.fs.list(`${root}/${folder.name}`).catch(() => [])) {
+      if (file.kind === 'file' && file.name.endsWith('.jsonl')) files.push({ path: `${root}/${folder.name}/${file.name}`, at: file.mtimeMs })
+    }
+  }
+  files.sort((a, b) => b.at - a.at)
+  const digests: Digest[] = []
+  for (const file of files.slice(0, 25)) {
+    const digest = await digestSession($, file.path, file.at).catch(() => null)
+    if (digest !== null) digests.push(digest)
+    if (digests.length === 10) break
+  }
+  return digests
+}
+
+const SUGGEST_SYSTEM = `You help a developer keep momentum across their Claude Code sessions. You get digests of their most recent sessions: the project, branch, their last prompts and Claude's last reply. Suggest the 3 to 5 most valuable next prompts they could send now. Prefer finishing what is half done, following up on what Claude proposed or asked, and verifying what was just built. Each prompt must be concrete, written in the user's own voice and language, and ready to send as is. Answer with only a JSON array of objects with keys "project" (the project folder name), "prompt", and "why" (under 12 words).`
+
+async function loadSuggestions($: EngineInterface) {
+  suggestState = 'loading'
+  $.ui.invalidate('ui.render')
+  try {
+    const digests = await recentSessions($)
+    if (digests.length === 0) throw new Error('no recent sessions with prompts found')
+    const now = await $.clock.now()
+    const prompt = digests
+      .map(
+        (digest, i) =>
+          `## Session ${i + 1}: ${digest.project}${digest.branch !== '' ? ` (${digest.branch})` : ''}${digest.title !== '' ? ` — ${digest.title}` : ''}, active ${formatSpan(now - digest.at)} ago\n` +
+          `Last prompts:\n${digest.prompts.map(text => `- ${text}`).join('\n')}\n` +
+          `Claude's last reply: ${digest.reply || '(none)'}`,
+      )
+      .join('\n\n')
+    const result = await $.model.complete({ model: 'sonnet', system: SUGGEST_SYSTEM, prompt, maxTokens: 1500 })
+    if (!result.isAnswered) throw new Error(`the model gave no answer (${result.reason})`)
+    const json = result.text.slice(result.text.indexOf('['), result.text.lastIndexOf(']') + 1)
+    const parsed = JSON.parse(json) as Partial<Suggestion>[]
+    const cwdOf = new Map(digests.map(digest => [digest.project, digest.cwd]))
+    suggestions = parsed
+      .filter(one => typeof one.prompt === 'string' && one.prompt.trim() !== '')
+      .slice(0, 5)
+      .map(one => ({
+        project: String(one.project ?? ''),
+        cwd: cwdOf.get(String(one.project ?? '')) ?? '',
+        prompt: oneLine(String(one.prompt)),
+        why: oneLine(String(one.why ?? '')),
+      }))
+    suggestState = 'ready'
+    suggestAt = now
+    await $.store.set('suggestions', { at: now, list: suggestions })
+  } catch (error) {
+    suggestState = 'error'
+    suggestError = error instanceof Error ? error.message : String(error)
+  }
+  $.ui.invalidate('ui.render')
 }
 
 let craftTasks: CraftTask[] = []
@@ -566,13 +690,19 @@ export const register: Register = on => {
     await $.command.register({
       name: 'hud',
       description:
-        'Show or hide the session HUD band; /hud tools, tasks, craft or kpi toggle a pane; /hud goal <n>, /hud idle <minutes|off>, /hud hours <9-19> set your KPIs; /hud update installs the latest version',
-      argumentHint: '[tools|tasks|craft|kpi|goal n|idle m|hours a-b|update]',
+        'Show or hide the session HUD band; /hud tools, tasks, craft, kpi or next toggle a pane; /hud goal <n>, /hud idle <minutes|off>, /hud hours <9-19> set your KPIs; /hud update installs the latest version',
+      argumentHint: '[tools|tasks|craft|kpi|next|goal n|idle m|hours a-b|update]',
     })
     isHidden = (await $.store.get('isHidden')) === true
     const saved = await $.store.get('settings')
     if (saved !== null && typeof saved === 'object') settings = { ...DEFAULT_SETTINGS, ...(saved as Partial<Settings>) }
     sessionId = await $.session.id().catch(() => 'session')
+    const cached = (await $.store.get('suggestions')) as { at?: number; list?: Suggestion[] } | null
+    if (cached !== null && typeof cached === 'object' && Array.isArray(cached.list)) {
+      suggestions = cached.list
+      suggestAt = cached.at ?? 0
+      suggestState = 'ready'
+    }
     void pruneKpis($).catch(() => {})
     void recordUsage($)
     void refreshGit($)
@@ -600,6 +730,17 @@ export const register: Register = on => {
   on('command.run', { command: 'hud' }, async ($, e) => {
     if (e.args.trim() === 'update') return updatePlugin($)
     const [verb = '', value = ''] = e.args.trim().split(/\s+/)
+    if (verb === 'next') {
+      const panes = await $.ui.panes()
+      if (panes.some(pane => pane.id === NEXT_PANE)) {
+        await $.ui.close({ id: NEXT_PANE })
+        return { text: 'Next pane closed.' }
+      }
+      // Suggestions older than two hours are made again
+      if (suggestState !== 'loading' && (suggestState !== 'ready' || (await $.clock.now()) - suggestAt > 2 * HOUR)) void loadSuggestions($)
+      const opened = await $.ui.open({ id: NEXT_PANE, title: 'Next' })
+      return { text: opened.isPlaced ? 'Next pane opened.' : 'Next pane opens once the terminal is wider.' }
+    }
     if (verb === 'kpi') {
       const panes = await $.ui.panes()
       if (panes.some(pane => pane.id === KPI_PANE)) {
@@ -1301,6 +1442,53 @@ export const register: Register = on => {
             {kpis.weeks.map(value => `${Math.round(value)}%`).join(' · ')}
           </Text>
         )}
+      </Box>
+    )
+  })
+
+  on('ui.render', { component: 'Pane', requestId: NEXT_PANE }, async ($, e) => {
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const now = await $.clock.now()
+    const here = await $.session.cwd().catch(() => '')
+
+    // Put the suggestion in the prompt box; one from another project says where it belongs
+    const pick = async (one: Suggestion) => {
+      const line = one.cwd !== '' && one.cwd !== here ? `(for ${one.project}, ${one.cwd}) ${one.prompt}` : one.prompt
+      const box = await $.prompt.read()
+      await $.prompt.fill(box.text.trim() === '' ? { text: line } : { text: ` ${line}`, mode: 'append' })
+    }
+
+    return (
+      <Box flexDirection="column">
+        <Box flexDirection="row" columnGap={2}>
+          <Text dimColor wrap="truncate-end">
+            {suggestState === 'loading'
+              ? 'Reading your last 10 sessions…'
+              : suggestState === 'error'
+                ? 'Could not make suggestions'
+                : suggestState === 'ready'
+                  ? `From your last 10 sessions · ${formatSpan(now - suggestAt)} ago`
+                  : 'No suggestions yet'}
+          </Text>
+          <Button key="next-refresh" label="refresh" hotkey="r" plain onPress={() => void loadSuggestions($)} />
+        </Box>
+        {suggestState === 'error' && <Text color="yellow" wrap="wrap">{suggestError}</Text>}
+        {suggestions.map((one, index) => (
+          <Box flexDirection="column">
+            <Text bold color={one.cwd === here ? 'green' : 'cyan'}>
+              {one.project !== '' ? one.project : 'session'}
+              {one.cwd === here && <Text dimColor> · this project</Text>}
+            </Text>
+            <Button
+              key={`next-${index}`}
+              label={one.prompt}
+              plain
+              hotkey={String(index + 1)}
+              onPress={() => void pick(one).catch(() => $.ui.toast('Could not put the prompt in the prompt box.'))}
+            />
+            {one.why !== '' && <Text dimColor wrap="truncate-end">{'   '}{one.why}</Text>}
+          </Box>
+        ))}
       </Box>
     )
   })

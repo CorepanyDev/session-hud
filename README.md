@@ -26,6 +26,8 @@ When no session has had a prompt for a while during work hours, a toast nudges y
 - `/hud idle 45` sets the nudge after 45 idle minutes; `/hud idle off` turns it off (default 30)
 - `/hud hours 9-19` sets work hours, Monday to Friday (default 9-19)
 
+Run `/hud next` for next-prompt suggestions. It reads the tail of your 10 most recently active sessions' transcripts (`~/.claude/projects`), keeps only the prompts you wrote and Claude's last reply, and asks Sonnet for the 3 to 5 most useful next prompts. Press a number to put one in your prompt; one from another project names its folder. Suggestions are kept for two hours (`r` makes new ones), and the idle nudge suggests the top one. Making suggestions spends a model call from your plan.
+
 Run `/hud update` to install the latest version from GitHub; it reloads plugins for you.
 
 ## Install
