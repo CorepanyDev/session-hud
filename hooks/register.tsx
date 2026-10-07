@@ -29,11 +29,13 @@ const GIT_PANE = 'hud-git'
 const WRAP_PANE = 'hud-wrap'
 const HELP_PANE = 'hud-help'
 
-// One repository you worked in this week, and what is left in it
+// One checkout of a repository: its main folder or one of its worktrees
+type Checkout = { top: string; branch: string; changed: number; unpushed: number; isMain: boolean }
+// One repository you worked in this week, its checkouts and what is left in them
 type Repo = {
   top: string
   name: string
-  branch: string
+  checkouts: Checkout[]
   changed: number
   unpushed: number
   commitsToday: string[]
@@ -557,52 +559,71 @@ const runGit = async ($: EngineInterface, top: string, args: string[]) => {
   return ran.exitCode === 0 ? ran.stdout.trim() : null
 }
 
-async function readRepo($: EngineInterface, top: string, midnight: number): Promise<Repo> {
-  const [branch, status, unpushed, email] = await Promise.all([
+async function readCheckout($: EngineInterface, top: string, common: string): Promise<Checkout> {
+  const [branch, status, unpushed] = await Promise.all([
     runGit($, top, ['rev-parse', '--abbrev-ref', 'HEAD']),
     runGit($, top, ['status', '--porcelain']),
     runGit($, top, ['rev-list', '--count', 'HEAD', '--not', '--remotes']),
-    runGit($, top, ['config', 'user.email']),
   ])
+  return {
+    top,
+    branch: branch ?? '?',
+    changed: (status ?? '').split('\n').filter(line => line.trim() !== '').length,
+    unpushed: Number(unpushed ?? 0) || 0,
+    isMain: `${top}/.git` === common,
+  }
+}
+
+// A repository's checkouts read together; its PRs and today's commits once, from the main folder
+async function readRepo($: EngineInterface, common: string, tops: string[], midnight: number): Promise<Repo> {
+  const main = common.endsWith('/.git') ? common.slice(0, -'/.git'.length) : (tops[0] ?? common)
+  const home = (await runGit($, main, ['rev-parse', '--show-toplevel'])) !== null ? main : (tops[0] ?? main)
+  const checkouts = await Promise.all(tops.map(top => readCheckout($, top, common)))
+  const email = await runGit($, home, ['config', 'user.email'])
   const log =
     email === null || email === ''
       ? null
-      : await runGit($, top, ['log', `--since=${new Date(midnight).toISOString()}`, `--author=${email}`, '--format=%s'])
+      : await runGit($, home, ['log', '--all', `--since=${new Date(midnight).toISOString()}`, `--author=${email}`, '--format=%s'])
   let prs: Repo['prs'] = []
   try {
     const ran = await $.process.run(['gh', 'pr', 'list', '--author', '@me', '--state', 'open', '--json', 'number,title,url', '--limit', '5'], {
-      cwd: top,
+      cwd: home,
       timeoutMs: 15000,
     })
     if (ran.exitCode === 0) prs = JSON.parse(ran.stdout) as Repo['prs']
   } catch {}
+  checkouts.sort((a, b) => Number(b.isMain) - Number(a.isMain) || b.changed + b.unpushed - (a.changed + a.unpushed))
   return {
-    top,
-    name: top.split('/').filter(part => part !== '').at(-1) ?? top,
-    branch: branch ?? '?',
-    changed: (status ?? '').split('\n').filter(line => line.trim() !== '').length,
-    unpushed: Number(unpushed ?? 0) || 0,
-    commitsToday: (log ?? '').split('\n').filter(line => line.trim() !== ''),
+    top: home,
+    name: home.split('/').filter(part => part !== '').at(-1) ?? home,
+    checkouts,
+    changed: checkouts.reduce((sum, one) => sum + one.changed, 0),
+    unpushed: checkouts.reduce((sum, one) => sum + one.unpushed, 0),
+    commitsToday: [...new Set((log ?? '').split('\n').filter(line => line.trim() !== ''))],
     prs,
   }
 }
 
-// Every repository your sessions touched in the last 7 days, the ones with work left first
+// Every repository your sessions touched in the last 7 days, worktrees under their repository, work left first
 async function loadRepos($: EngineInterface) {
   reposState = 'loading'
   $.ui.invalidate('ui.render')
   try {
     const now = await $.clock.now()
-    const tops = new Set<string>()
+    const byCommon = new Map<string, Set<string>>()
     for (const folder of await recentFolders($, now - 7 * 24 * HOUR)) {
       const top = await runGit($, folder, ['rev-parse', '--show-toplevel']).catch(() => null)
-      if (top !== null && top !== '') tops.add(top)
-      if (tops.size >= 15) break
+      if (top === null || top === '') continue
+      const common = await runGit($, top, ['rev-parse', '--path-format=absolute', '--git-common-dir']).catch(() => null)
+      const key = common ?? `${top}/.git`
+      byCommon.set(key, (byCommon.get(key) ?? new Set()).add(top))
+      if (byCommon.size >= 15) break
     }
     const midnight = new Date(now).setHours(0, 0, 0, 0)
-    repos = (await Promise.all([...tops].map(top => readRepo($, top, midnight).catch(() => null))))
+    const weight = (repo: Repo) => repo.changed + repo.unpushed * 2 + repo.prs.length * 3
+    repos = (await Promise.all([...byCommon].map(([common, tops]) => readRepo($, common, [...tops], midnight).catch(() => null))))
       .filter((repo): repo is Repo => repo !== null)
-      .sort((a, b) => b.changed + b.unpushed * 2 + b.prs.length * 3 - (a.changed + a.unpushed * 2 + a.prs.length * 3))
+      .sort((a, b) => weight(b) - weight(a))
     reposState = 'ready'
     reposAt = now
   } catch (error) {
@@ -681,7 +702,7 @@ async function loadWrap($: EngineInterface) {
     const commits = repos.flatMap(repo => repo.commitsToday.map(subject => `${repo.name}: ${subject}`))
     const left = repos
       .filter(repo => repo.changed > 0 || repo.unpushed > 0 || repo.prs.length > 0)
-      .map(repo => `${repo.name} (${repo.branch}): ${repo.changed} changed files, ${repo.unpushed} unpushed commits${repo.prs.length > 0 ? `, open PRs ${repo.prs.map(pr => `#${pr.number} ${pr.title}`).join('; ')}` : ''}`)
+      .map(repo => `${repo.name} (${repo.checkouts.filter(one => one.changed + one.unpushed > 0).map(one => one.branch).join(', ') || 'no branch with changes'}): ${repo.changed} changed files, ${repo.unpushed} unpushed commits${repo.prs.length > 0 ? `, open PRs ${repo.prs.map(pr => `#${pr.number} ${pr.title}`).join('; ')}` : ''}`)
     const prompt = [
       `Today: ${kpis?.today.prompts ?? 0} prompts, ${kpis?.today.focus ?? 0} focus blocks, ${kpis?.today.tasksDone ?? 0} Craft tasks done.`,
       `## Commits today\n${commits.length > 0 ? commits.map(line => `- ${line}`).join('\n') : '(none)'}`,
@@ -1854,12 +1875,17 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: GIT_PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const now = await $.clock.now()
+    const columns = e.viewport?.columns ?? 70
     const fill = async (text: string) => {
       const box = await $.prompt.read()
       await $.prompt.fill(box.text.trim() === '' ? { text } : { text: ` ${text}`, mode: 'append' })
     }
+    const plural = (count: number, word: string) => `${count} ${word}${count === 1 ? '' : 's'}`
+    const cut = (text: string, room: number) => (text.length > room ? `${text.slice(0, Math.max(1, room - 1))}…` : text)
     const busy = repos.filter(repo => repo.changed > 0 || repo.unpushed > 0 || repo.prs.length > 0)
-    const clean = repos.length - busy.length
+    const clean = repos.filter(repo => !busy.includes(repo))
+    const branchRoom = Math.max(16, Math.min(40, columns - 34))
+
     return (
       <Box flexDirection="column">
         <Box flexDirection="row" columnGap={2}>
@@ -1868,47 +1894,68 @@ export const register: Register = on => {
               ? 'Checking the repos you worked in this week…'
               : reposState === 'error'
                 ? 'Could not check your repos'
-                : `${busy.length} with work left · ${clean} clean · ${formatSpan(now - reposAt)} ago`}
+                : `${plural(busy.length, 'repo')} with work left · updated ${formatSpan(now - reposAt)} ago`}
           </Text>
           <Button key="git-refresh" label="refresh" hotkey="r" plain onPress={() => void loadRepos($)} />
         </Box>
         {reposState === 'error' && <Text color="yellow" wrap="wrap">{reposError}</Text>}
         {reposState === 'ready' && busy.length === 0 && <Text color="green">Everything is committed and pushed.</Text>}
-        {busy.map(repo => (
-          <Box flexDirection="column">
-            <Text wrap="truncate-end">
-              <Text bold color="cyan">{repo.name}</Text>
-              <Text dimColor> ⎇ {repo.branch}</Text>
-              {repo.commitsToday.length > 0 && <Text color="green"> · {repo.commitsToday.length} commits today</Text>}
-            </Text>
-            <Box flexDirection="row" columnGap={2} flexWrap="wrap">
-              {repo.changed > 0 && (
-                <Button
-                  key={`git-commit-${repo.top}`}
-                  label={`✎ ${repo.changed} uncommitted`}
-                  plain
-                  onPress={() => void fill(`In ${repo.top}: review the uncommitted changes on ${repo.branch}, then commit and push them.`).catch(() => {})}
-                />
-              )}
-              {repo.unpushed > 0 && (
-                <Button
-                  key={`git-push-${repo.top}`}
-                  label={`↑ ${repo.unpushed} unpushed`}
-                  plain
-                  onPress={() => void fill(`In ${repo.top}: push the ${repo.unpushed} unpushed commits on ${repo.branch}, and open a PR if there is none.`).catch(() => {})}
-                />
-              )}
-              {repo.prs.map(pr => (
-                <Button
-                  key={`git-pr-${repo.top}-${pr.number}`}
-                  label={`PR #${pr.number} ${pr.title.slice(0, 40)}`}
-                  plain
-                  onPress={() => void fill(`In ${repo.top}: review PR #${pr.number} (${pr.url}) and tell me what is left before merging.`).catch(() => {})}
-                />
+        {busy.map(repo => {
+          const active = repo.checkouts.filter(one => one.changed > 0 || one.unpushed > 0)
+          const idle = repo.checkouts.length - active.length
+          return (
+            <Box flexDirection="column">
+              <Text wrap="truncate-end">
+                <Text bold color="cyan">{repo.name}</Text>
+                {repo.commitsToday.length > 0 && <Text color="green">  {plural(repo.commitsToday.length, 'commit')} today</Text>}
+                {repo.prs.length > 0 && <Text color="magenta">  {plural(repo.prs.length, 'open PR')}</Text>}
+              </Text>
+              {active.map(one => (
+                <Box flexDirection="row" columnGap={2}>
+                  <Text wrap="truncate-end">
+                    {'  '}
+                    <Text dimColor>⎇ </Text>
+                    {cut(one.branch, branchRoom).padEnd(branchRoom)}
+                  </Text>
+                  {one.changed > 0 && (
+                    <Button
+                      key={`git-commit-${one.top}`}
+                      label={`✎ ${one.changed} to commit`}
+                      plain
+                      onPress={() => void fill(`In ${one.top}: review the uncommitted changes on ${one.branch}, then commit and push them.`).catch(() => {})}
+                    />
+                  )}
+                  {one.unpushed > 0 && (
+                    <Button
+                      key={`git-push-${one.top}`}
+                      label={`↑ ${one.unpushed} to push`}
+                      plain
+                      onPress={() => void fill(`In ${one.top}: push the ${plural(one.unpushed, 'unpushed commit')} on ${one.branch}, and open a PR if there is none.`).catch(() => {})}
+                    />
+                  )}
+                  {!one.isMain && <Text dimColor>worktree</Text>}
+                </Box>
               ))}
+              {repo.prs.map(pr => (
+                <Box flexDirection="row">
+                  <Text>{'  '}</Text>
+                  <Button
+                    key={`git-pr-${repo.top}-${pr.number}`}
+                    label={`PR #${pr.number}  ${cut(pr.title, columns - 16)}`}
+                    plain
+                    onPress={() => void fill(`In ${repo.top}: review PR #${pr.number} (${pr.url}) and tell me what is left before merging.`).catch(() => {})}
+                  />
+                </Box>
+              ))}
+              {idle > 0 && <Text dimColor>  + {plural(idle, 'clean checkout')}</Text>}
             </Box>
-          </Box>
-        ))}
+          )
+        })}
+        {clean.length > 0 && (
+          <Text dimColor wrap="wrap">
+            Clean: {clean.map(repo => repo.name).join(', ')}
+          </Text>
+        )}
       </Box>
     )
   })

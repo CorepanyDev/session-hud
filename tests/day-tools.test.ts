@@ -24,29 +24,43 @@ const base = (on: On, now = WEDNESDAY_10) => {
   return { clock, toasts }
 }
 
-const transcript = JSON.stringify({ type: 'user', cwd: '/work/shop', origin: { kind: 'human' }, message: { content: 'ship the cart' } })
+const transcript = (cwd: string) => JSON.stringify({ type: 'user', cwd, origin: { kind: 'human' }, message: { content: 'ship the cart' } })
 
-// A fake machine: one transcript in /work/shop, a git repo there with changes, a commit and a PR
+// A fake machine: sessions in /work/shop and two of its worktrees, with changes, a commit and one PR
+const WORKTREE_A = '/work/shop/.claude/worktrees/dreamy-a1'
+const WORKTREE_B = '/work/shop/.claude/worktrees/clean-b2'
 const machine = (on: On) => {
   on('env.get', () => ({ value: '/home/me' }))
   on('fs.list', (_, e) =>
     e.path === '/home/me/.claude/projects'
       ? { value: [{ name: '-work-shop', kind: 'dir', size: 0, mtimeMs: 0, isLink: false }] }
-      : { value: [{ name: 'a.jsonl', kind: 'file', size: 10, mtimeMs: WEDNESDAY_10 - 3600_000, isLink: false }] },
+      : {
+          value: ['a', 'b', 'c'].map(name => ({ name: `${name}.jsonl`, kind: 'file', size: 10, mtimeMs: WEDNESDAY_10 - 3600_000, isLink: false })),
+        },
   )
+  const gh: string[] = []
   on('process.run', (_, e) => {
     const argv = e.argv.join(' ')
     const out = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '' } })
-    if (argv.startsWith('tail')) return out(`cut\n${transcript}`)
-    if (argv.includes('--show-toplevel')) return out('/work/shop\n')
-    if (argv.includes('--abbrev-ref')) return out('cart\n')
-    if (argv.includes('status --porcelain')) return out(' M a.ts\n M b.ts\n')
-    if (argv.includes('--not --remotes')) return out('1\n')
+    if (argv.startsWith('tail')) {
+      const cwd = argv.includes('a.jsonl') ? '/work/shop' : argv.includes('b.jsonl') ? WORKTREE_A : WORKTREE_B
+      return out(`cut\n${transcript(cwd)}`)
+    }
+    const at = e.argv[2] ?? ''
+    if (argv.includes('--show-toplevel')) return out(`${at}\n`)
+    if (argv.includes('--git-common-dir')) return out('/work/shop/.git\n')
+    if (argv.includes('--abbrev-ref')) return out(at === '/work/shop' ? 'cart\n' : at === WORKTREE_A ? 'fix/checkout-total\n' : 'docs\n')
+    if (argv.includes('status --porcelain')) return out(at === '/work/shop' ? ' M a.ts\n M b.ts\n' : '')
+    if (argv.includes('--not --remotes')) return out(at === WORKTREE_A ? '3\n' : '0\n')
     if (argv.includes('user.email')) return out('me@example.com\n')
     if (argv.includes(' log ')) return out('Add the cart page\n')
-    if (argv.startsWith('gh pr list')) return out(JSON.stringify([{ number: 12, title: 'Cart page', url: 'https://github.com/x/shop/pull/12' }]))
+    if (argv.startsWith('gh pr list')) {
+      gh.push(argv)
+      return out(JSON.stringify([{ number: 12, title: 'Cart page', url: 'https://github.com/x/shop/pull/12' }]))
+    }
     return out('', 1)
   })
+  return { gh }
 }
 
 test('/hud focus counts down in the band, chimes into a break and counts the block', async ($, on) => {
@@ -70,9 +84,9 @@ test('/hud focus counts down in the band, chimes into a break and counts the blo
   expect((await $.command.run({ command: 'hud', args: 'focus soon' })).text).toMatch(/Use \/hud focus/)
 })
 
-test('/hud git lists uncommitted, unpushed and PRs, and a press fills the prompt', async ($, on) => {
+test('/hud git groups worktrees under their repo, asks GitHub once, and a press fills the prompt', async ($, on) => {
   base(on)
-  machine(on)
+  const { gh } = machine(on)
   let filled = ''
   on('prompt.read', () => ({ value: { text: '', cursor: 0 } }))
   on('prompt.fill', (_, e) => {
@@ -81,11 +95,16 @@ test('/hud git lists uncommitted, unpushed and PRs, and a press fills the prompt
   })
   await $.command.run({ command: 'hud', args: 'git' })
   const pane = await $.ui.mount({ plugin: 'session-hud', surface: 'terminal', component: 'Pane', requestId: 'hud-git', props: {} })
-  expect(await pane.find({ type: 'Text', text: /1 with work left/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /1 repo with work left/ })).toBeDefined()
   expect(await pane.find({ type: 'Text', text: /^shop$/ })).toBeDefined()
-  expect(await pane.find({ type: 'Text', text: /1 commits today/ })).toBeDefined()
-  expect(await pane.find({ type: 'Button', text: /✎ 2 uncommitted/ })).toBeDefined()
-  expect(await pane.find({ type: 'Button', text: /↑ 1 unpushed/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /1 commit today/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /1 open PR/ })).toBeDefined()
+  expect(await pane.find({ type: 'Button', text: /✎ 2 to commit/ })).toBeDefined()
+  expect(await pane.find({ type: 'Button', text: /↑ 3 to push/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /\+ 1 clean checkout/ })).toBeDefined()
+  expect(gh).toHaveLength(1)
+  await pane.press({ key: `git-push-${WORKTREE_A}` })
+  expect(filled).toBe(`In ${WORKTREE_A}: push the 3 unpushed commits on fix/checkout-total, and open a PR if there is none.`)
   await pane.press({ key: 'git-pr-/work/shop-12' })
   expect(filled).toBe('In /work/shop: review PR #12 (https://github.com/x/shop/pull/12) and tell me what is left before merging.')
   await pane.unmount()
@@ -116,7 +135,7 @@ test('/hud wrap writes the day from sessions and commits, and saves it to the Cr
   const pane = await $.ui.mount({ plugin: 'session-hud', surface: 'terminal', component: 'Pane', requestId: 'hud-wrap', props: {} })
   expect(asked).toMatch(/shop: Add the cart page/)
   expect(asked).toMatch(/- ship the cart/)
-  expect(asked).toMatch(/2 changed files, 1 unpushed commits, open PRs #12 Cart page/)
+  expect(asked).toMatch(/shop \(cart, fix\/checkout-total\): 2 changed files, 3 unpushed commits, open PRs #12 Cart page/)
   expect(await pane.find({ type: 'Text', text: /Shipped the cart’s page|Shipped the cart's page/ })).toBeDefined()
   expect(await pane.find({ type: 'Button', text: /Merge PR #12/ })).toBeDefined()
 
