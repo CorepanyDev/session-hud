@@ -25,6 +25,23 @@ const CLICKUP = 'claude.ai Clickup'
 const CRAFT_PANE = 'hud-craft'
 const KPI_PANE = 'hud-kpi'
 const NEXT_PANE = 'hud-next'
+const GIT_PANE = 'hud-git'
+const WRAP_PANE = 'hud-wrap'
+const HELP_PANE = 'hud-help'
+
+// One repository you worked in this week, and what is left in it
+type Repo = {
+  top: string
+  name: string
+  branch: string
+  changed: number
+  unpushed: number
+  commitsToday: string[]
+  prs: { number: number; title: string; url: string }[]
+}
+// A focus block or the break after it, shared by every session through the store
+type Focus = { mode: 'focus' | 'break'; until: number; minutes: number }
+type Wrap = { day: string; done: string[]; open: string[]; tomorrow: string[] }
 
 // A next prompt worth sending, suggested from your recent sessions
 type Suggestion = { project: string; cwd: string; prompt: string; why: string }
@@ -32,14 +49,14 @@ type Suggestion = { project: string; cwd: string; prompt: string; why: string }
 type Digest = { project: string; cwd: string; branch: string; title: string; at: number; prompts: string[]; reply: string }
 
 // One session's record for one day; the pane adds up every session's
-type DayRecord = { prompts: number; hours: number[]; tasksDone: number }
+type DayRecord = { prompts: number; hours: number[]; tasksDone: number; focus: number }
 type Kpis = {
   today: DayRecord
   week: { day: string; prompts: number; usage: number | null }[]
   weeks: number[]
   streak: number
 }
-type Settings = { goal: number; idleMinutes: number; startHour: number; endHour: number; sound: boolean }
+type Settings = { goal: number; idleMinutes: number; startHour: number; endHour: number; sound: boolean; focusMinutes: number; breakMinutes: number }
 const CRAFT = 'claude.ai Craft'
 
 // One of your active Craft tasks
@@ -238,7 +255,7 @@ async function openTask($: EngineInterface, task: Task) {
   await openLink($, task.url)
 }
 
-const DEFAULT_SETTINGS: Settings = { goal: 30, idleMinutes: 30, startHour: 9, endHour: 19, sound: true }
+const DEFAULT_SETTINGS: Settings = { goal: 30, idleMinutes: 30, startHour: 9, endHour: 19, sound: true, focusMinutes: 25, breakMinutes: 5 }
 
 const chime = ($: EngineInterface) => $.audio.play({ asset: 'sounds/chime.wav' }, { gain: 0.8 })
 let settings: Settings = DEFAULT_SETTINGS
@@ -247,7 +264,7 @@ let kpis: Kpis | null = null
 let isTurnRunning = false
 let lastPromptAt = 0
 
-const emptyDay = (): DayRecord => ({ prompts: 0, hours: Array.from({ length: 24 }, () => 0), tasksDone: 0 })
+const emptyDay = (): DayRecord => ({ prompts: 0, hours: Array.from({ length: 24 }, () => 0), tasksDone: 0, focus: 0 })
 const dayKey = (day: string) => `kpi:${day}:${sessionId}`
 
 // The days of the week holding a time, Monday first
@@ -299,6 +316,7 @@ async function loadKpis($: EngineInterface) {
     const total = byDay.get(match[1]) ?? emptyDay()
     total.prompts += saved.prompts ?? 0
     total.tasksDone += saved.tasksDone ?? 0
+    total.focus += saved.focus ?? 0
     saved.hours?.forEach((count, hour) => (total.hours[hour] = (total.hours[hour] ?? 0) + count))
     byDay.set(match[1], total)
   }
@@ -345,7 +363,7 @@ const isWorkTime = (ms: number) => {
 
 // Nudge when nobody prompted in any session for a while during work hours; one session nudges
 async function checkIdle($: EngineInterface) {
-  if (settings.idleMinutes <= 0 || isTurnRunning) return
+  if (settings.idleMinutes <= 0 || isTurnRunning || focus !== null) return
   const now = await $.clock.now()
   if (!isWorkTime(now)) return
   const shared = await $.store.get('lastPrompt')
@@ -501,6 +519,248 @@ async function loadSuggestions($: EngineInterface) {
     suggestError = error instanceof Error ? error.message : String(error)
   }
   $.ui.invalidate('ui.render')
+}
+
+const formatClock = (ms: number) => new Date(ms).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
+const formatCountdown = (ms: number) => {
+  const seconds = Math.max(0, Math.ceil(ms / 1000))
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
+}
+
+// ----- Git: the repositories you worked in this week
+
+let repos: Repo[] = []
+let reposState: 'never' | 'loading' | 'ready' | 'error' = 'never'
+let reposError = ''
+let reposAt = 0
+
+// The folders your sessions worked in since a time, read from each transcript's tail
+async function recentFolders($: EngineInterface, since: number) {
+  const home = await $.env.get('HOME')
+  if (home === undefined) return []
+  const root = `${home}/.claude/projects`
+  const folders = new Set<string>()
+  for (const folder of await $.fs.list(root).catch(() => [])) {
+    if (folder.kind !== 'dir') continue
+    for (const file of await $.fs.list(`${root}/${folder.name}`).catch(() => [])) {
+      if (file.kind !== 'file' || !file.name.endsWith('.jsonl') || file.mtimeMs < since) continue
+      const tail = await $.process.run(['tail', '-c', '20000', `${root}/${folder.name}/${file.name}`], { timeoutMs: 5000 }).catch(() => null)
+      const cwd = [...(tail?.stdout ?? '').matchAll(/"cwd":"((?:[^"\\]|\\.)+)"/g)].at(-1)?.[1]
+      if (cwd !== undefined) folders.add(cwd)
+    }
+  }
+  return [...folders]
+}
+
+const runGit = async ($: EngineInterface, top: string, args: string[]) => {
+  const ran = await $.process.run(['git', '-C', top, ...args], { timeoutMs: 8000 })
+  return ran.exitCode === 0 ? ran.stdout.trim() : null
+}
+
+async function readRepo($: EngineInterface, top: string, midnight: number): Promise<Repo> {
+  const [branch, status, unpushed, email] = await Promise.all([
+    runGit($, top, ['rev-parse', '--abbrev-ref', 'HEAD']),
+    runGit($, top, ['status', '--porcelain']),
+    runGit($, top, ['rev-list', '--count', 'HEAD', '--not', '--remotes']),
+    runGit($, top, ['config', 'user.email']),
+  ])
+  const log =
+    email === null || email === ''
+      ? null
+      : await runGit($, top, ['log', `--since=${new Date(midnight).toISOString()}`, `--author=${email}`, '--format=%s'])
+  let prs: Repo['prs'] = []
+  try {
+    const ran = await $.process.run(['gh', 'pr', 'list', '--author', '@me', '--state', 'open', '--json', 'number,title,url', '--limit', '5'], {
+      cwd: top,
+      timeoutMs: 15000,
+    })
+    if (ran.exitCode === 0) prs = JSON.parse(ran.stdout) as Repo['prs']
+  } catch {}
+  return {
+    top,
+    name: top.split('/').filter(part => part !== '').at(-1) ?? top,
+    branch: branch ?? '?',
+    changed: (status ?? '').split('\n').filter(line => line.trim() !== '').length,
+    unpushed: Number(unpushed ?? 0) || 0,
+    commitsToday: (log ?? '').split('\n').filter(line => line.trim() !== ''),
+    prs,
+  }
+}
+
+// Every repository your sessions touched in the last 7 days, the ones with work left first
+async function loadRepos($: EngineInterface) {
+  reposState = 'loading'
+  $.ui.invalidate('ui.render')
+  try {
+    const now = await $.clock.now()
+    const tops = new Set<string>()
+    for (const folder of await recentFolders($, now - 7 * 24 * HOUR)) {
+      const top = await runGit($, folder, ['rev-parse', '--show-toplevel']).catch(() => null)
+      if (top !== null && top !== '') tops.add(top)
+      if (tops.size >= 15) break
+    }
+    const midnight = new Date(now).setHours(0, 0, 0, 0)
+    repos = (await Promise.all([...tops].map(top => readRepo($, top, midnight).catch(() => null))))
+      .filter((repo): repo is Repo => repo !== null)
+      .sort((a, b) => b.changed + b.unpushed * 2 + b.prs.length * 3 - (a.changed + a.unpushed * 2 + a.prs.length * 3))
+    reposState = 'ready'
+    reposAt = now
+  } catch (error) {
+    reposState = 'error'
+    reposError = error instanceof Error ? error.message : String(error)
+  }
+  $.ui.invalidate('ui.render')
+}
+
+// ----- Focus timer
+
+let focus: Focus | null = null
+
+async function readFocus($: EngineInterface) {
+  const saved = (await $.store.get('focus')) as Focus | null
+  focus = saved !== null && typeof saved === 'object' && typeof saved.until === 'number' ? saved : null
+}
+
+async function startFocus($: EngineInterface, minutes: number) {
+  const now = await $.clock.now()
+  focus = { mode: 'focus', until: now + minutes * MINUTE, minutes }
+  await $.store.set('focus', focus)
+  $.ui.invalidate('ui.render')
+}
+
+async function stopFocus($: EngineInterface) {
+  focus = null
+  await $.store.delete('focus')
+  $.ui.invalidate('ui.render')
+}
+
+// When a block or a break runs out: one session chimes, counts the block and starts the break
+async function checkFocus($: EngineInterface) {
+  await readFocus($)
+  if (focus === null) return
+  const now = await $.clock.now()
+  if (now < focus.until) return
+  const ended = await $.store.get('focusEndedAt')
+  if (ended === focus.until) return
+  await $.store.set('focusEndedAt', focus.until)
+  if (settings.sound) void chime($).catch(() => {})
+  if (focus.mode === 'focus') {
+    const minutes = focus.minutes
+    void bumpToday($, record => (record.focus += 1)).then(() => loadKpis($)).catch(() => {})
+    focus = { mode: 'break', until: now + settings.breakMinutes * MINUTE, minutes }
+    await $.store.set('focus', focus)
+    $.ui.toast(`Focus block done (${minutes}m). Break until ${formatClock(focus.until)}.`)
+  } else {
+    await stopFocus($)
+    const idea = suggestions[0]
+    $.ui.toast(`Break's over.${idea !== undefined ? ` Next: ${idea.project}: ${idea.prompt.slice(0, 60)}` : ' /hud focus for another block.'}`)
+    if (idea !== undefined) void $.prompt.suggest({ text: idea.prompt }).catch(() => {})
+  }
+  $.ui.invalidate('ui.render')
+}
+
+// ----- End-of-day wrap
+
+let wrap: Wrap | null = null
+let wrapState: 'never' | 'loading' | 'ready' | 'error' = 'never'
+let wrapError = ''
+let wrapSaved = ''
+
+const WRAP_SYSTEM = `You write a developer's end-of-day note from what happened in their Claude Code sessions today. Be concrete and short: name projects, features and PRs. Answer with only a JSON object with three arrays of short strings: "done" (what got finished or shipped, at most 6), "open" (what is half done or waiting, at most 5), "tomorrow" (the first 3 concrete next steps, most important first, each a ready-to-send prompt in the user's own voice).`
+
+async function loadWrap($: EngineInterface) {
+  wrapState = 'loading'
+  wrapSaved = ''
+  $.ui.invalidate('ui.render')
+  try {
+    const now = await $.clock.now()
+    const midnight = new Date(now).setHours(0, 0, 0, 0)
+    await loadKpis($)
+    await loadRepos($)
+    const sessions = (await recentSessions($)).filter(digest => digest.at >= midnight)
+    const commits = repos.flatMap(repo => repo.commitsToday.map(subject => `${repo.name}: ${subject}`))
+    const left = repos
+      .filter(repo => repo.changed > 0 || repo.unpushed > 0 || repo.prs.length > 0)
+      .map(repo => `${repo.name} (${repo.branch}): ${repo.changed} changed files, ${repo.unpushed} unpushed commits${repo.prs.length > 0 ? `, open PRs ${repo.prs.map(pr => `#${pr.number} ${pr.title}`).join('; ')}` : ''}`)
+    const prompt = [
+      `Today: ${kpis?.today.prompts ?? 0} prompts, ${kpis?.today.focus ?? 0} focus blocks, ${kpis?.today.tasksDone ?? 0} Craft tasks done.`,
+      `## Commits today\n${commits.length > 0 ? commits.map(line => `- ${line}`).join('\n') : '(none)'}`,
+      `## Work left in repositories\n${left.length > 0 ? left.map(line => `- ${line}`).join('\n') : '(none)'}`,
+      `## Sessions today\n${
+        sessions.length > 0
+          ? sessions
+              .map(digest => `### ${digest.project}${digest.title !== '' ? ` — ${digest.title}` : ''}\nPrompts:\n${digest.prompts.map(text => `- ${text}`).join('\n')}\nLast reply: ${digest.reply}`)
+              .join('\n\n')
+          : '(none)'
+      }`,
+    ].join('\n\n')
+    const result = await $.model.complete({ model: 'sonnet', system: WRAP_SYSTEM, prompt, maxTokens: 1500 })
+    if (!result.isAnswered) throw new Error(`the model gave no answer (${result.reason})`)
+    const parsed = JSON.parse(result.text.slice(result.text.indexOf('{'), result.text.lastIndexOf('}') + 1)) as Partial<Wrap>
+    const list = (value: unknown) => (Array.isArray(value) ? value.map(item => oneLine(String(item))).filter(item => item !== '') : [])
+    wrap = { day: isoDay(now), done: list(parsed.done), open: list(parsed.open), tomorrow: list(parsed.tomorrow).slice(0, 3) }
+    await $.store.set(`wrap:${wrap.day}`, wrap)
+    wrapState = 'ready'
+  } catch (error) {
+    wrapState = 'error'
+    wrapError = error instanceof Error ? error.message : String(error)
+  }
+  $.ui.invalidate('ui.render')
+}
+
+// The wrap as blocks for Craft's daily note; straight quotes become curly so the command stays one argument
+async function saveWrap($: EngineInterface) {
+  if (wrap === null) return
+  const safe = (text: string) => text.replace(/'/g, '’')
+  const stats = `${kpis?.today.prompts ?? 0} prompts · ${kpis?.today.focus ?? 0} focus blocks · ${kpis?.today.tasksDone ?? 0} tasks done · ${repos.reduce((sum, repo) => sum + repo.commitsToday.length, 0)} commits`
+  const blocks = [
+    `## End of day · ${stats}`,
+    '**Done**',
+    ...wrap.done.map(item => `- ${item}`),
+    '**Open**',
+    ...wrap.open.map(item => `- ${item}`),
+    '**Tomorrow**',
+    ...wrap.tomorrow.map(item => `- [ ] ${item}`),
+  ].map(markdown => ({ type: 'text', markdown: safe(markdown) }))
+  craftServer = await findServer($, 'craft_read', CRAFT)
+  try {
+    mcpText(await $.mcp.call(craftServer, 'craft_write', { command: `blocks add --date ${wrap.day} --json '${JSON.stringify(blocks)}'` }))
+    wrapSaved = 'Saved to today’s Craft daily note.'
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    wrapSaved = /does not exist/i.test(message)
+      ? 'Today’s Craft daily note does not exist yet. Open today in Craft once, then press s again.'
+      : explainFailure('Craft', message, craftServer, ['craft_read', 'craft_write'])
+  }
+  $.ui.invalidate('ui.render')
+}
+
+// At the end of work hours, once a day: the wrap, with a chime. In the morning: yesterday's first next step
+async function checkDay($: EngineInterface) {
+  const now = await $.clock.now()
+  const day = new Date(now)
+  const today = isoDay(now)
+  if (day.getDay() < 1 || day.getDay() > 5) return
+  if (day.getHours() >= settings.endHour && (await $.store.get('wrapOfferedOn')) !== today) {
+    if ((kpis?.today.prompts ?? 0) === 0) return
+    await $.store.set('wrapOfferedOn', today)
+    if (settings.sound) void chime($).catch(() => {})
+    $.ui.toast('Day’s end. Your wrap is ready: /hud wrap')
+    void loadWrap($)
+    void $.ui.open({ id: WRAP_PANE, title: 'Today' }).catch(() => {})
+    return
+  }
+  if (isWorkTime(now) && (await $.store.get('morningOn')) !== today) {
+    await $.store.set('morningOn', today)
+    const keys = (await $.store.keys()).filter(key => key.startsWith('wrap:') && key < `wrap:${today}`).sort()
+    const last = keys.at(-1)
+    const saved = last === undefined ? null : ((await $.store.get(last)) as Wrap | null)
+    const first = saved?.tomorrow?.[0]
+    if (first !== undefined) {
+      $.ui.toast(`From your last wrap: ${first.slice(0, 80)}`)
+      void $.prompt.suggest({ text: first }).catch(() => {})
+    }
+  }
 }
 
 let craftTasks: CraftTask[] = []
@@ -693,13 +953,14 @@ export const register: Register = on => {
     await $.command.register({
       name: 'hud',
       description:
-        'Show or hide the session HUD band; /hud tools, tasks, craft, kpi or next toggle a pane, /hud all every pane; /hud goal <n>, /hud idle <minutes|off>, /hud hours <9-19> set your KPIs; /hud update installs the latest version',
-      argumentHint: '[all|tools|tasks|craft|kpi|next|goal n|idle m|hours a-b|sound on/off/test|update]',
+        'Show or hide the session HUD band; /hud help lists everything; /hud tools, tasks, craft, kpi, next, git or wrap toggle a pane, /hud all every pane; /hud focus starts a focus block; /hud goal <n>, /hud idle <minutes|off>, /hud hours <9-19> set your KPIs; /hud update installs the latest version',
+      argumentHint: '[help|all|tools|tasks|craft|kpi|next|git|wrap|focus n|goal n|idle m|hours a-b|sound on/off/test|update]',
     })
     isHidden = (await $.store.get('isHidden')) === true
     const saved = await $.store.get('settings')
     if (saved !== null && typeof saved === 'object') settings = { ...DEFAULT_SETTINGS, ...(saved as Partial<Settings>) }
     sessionId = await $.session.id().catch(() => 'session')
+    await readFocus($).catch(() => {})
     const cached = (await $.store.get('suggestions')) as { at?: number; list?: Suggestion[] } | null
     if (cached !== null && typeof cached === 'object' && Array.isArray(cached.list)) {
       suggestions = cached.list
@@ -717,8 +978,11 @@ export const register: Register = on => {
         if ((await $.ui.panes()).some(pane => pane.id === TASKS_PANE)) void loadTasks($)
       }
       const tick = await $.clock.now()
+      void checkFocus($).catch(() => {})
       if (Math.floor(tick / MINUTE) !== Math.floor((tick - 5000) / MINUTE)) {
         void checkIdle($).catch(() => {})
+        void checkDay($).catch(() => {})
+        if (reposState !== 'loading' && tick - reposAt > 5 * MINUTE && (await $.ui.panes()).some(pane => pane.id === GIT_PANE)) void loadRepos($)
         if ((await $.ui.panes()).some(pane => pane.id === KPI_PANE)) void loadKpis($).catch(() => {})
         if (Math.floor(tick / MINUTE) % 5 === 0) void recordUsage($)
       }
@@ -733,6 +997,53 @@ export const register: Register = on => {
   on('command.run', { command: 'hud' }, async ($, e) => {
     if (e.args.trim() === 'update') return updatePlugin($)
     const [verb = '', value = ''] = e.args.trim().split(/\s+/)
+    if (verb === 'help') {
+      const panes = await $.ui.panes()
+      if (panes.some(pane => pane.id === HELP_PANE)) {
+        await $.ui.close({ id: HELP_PANE })
+        return { text: 'Help closed.' }
+      }
+      await $.ui.open({ id: HELP_PANE, title: 'Help' })
+      return { text: 'HUD help opened.' }
+    }
+    if (verb === 'git') {
+      const panes = await $.ui.panes()
+      if (panes.some(pane => pane.id === GIT_PANE)) {
+        await $.ui.close({ id: GIT_PANE })
+        return { text: 'Git pane closed.' }
+      }
+      void loadRepos($)
+      const opened = await $.ui.open({ id: GIT_PANE, title: 'Git' })
+      return { text: opened.isPlaced ? 'Git pane opened.' : 'Git pane opens once the terminal is wider.' }
+    }
+    if (verb === 'wrap') {
+      const panes = await $.ui.panes()
+      if (panes.some(pane => pane.id === WRAP_PANE)) {
+        await $.ui.close({ id: WRAP_PANE })
+        return { text: 'Wrap closed.' }
+      }
+      const today = isoDay(await $.clock.now())
+      if (wrap?.day !== today) {
+        const saved = (await $.store.get(`wrap:${today}`)) as Wrap | null
+        if (saved !== null && typeof saved === 'object') {
+          wrap = saved
+          wrapState = 'ready'
+          void loadKpis($).catch(() => {})
+        } else if (wrapState !== 'loading') void loadWrap($)
+      }
+      const opened = await $.ui.open({ id: WRAP_PANE, title: 'Today' })
+      return { text: opened.isPlaced ? 'Today’s wrap opened.' : 'The wrap opens once the terminal is wider.' }
+    }
+    if (verb === 'focus') {
+      if (value === 'stop') {
+        await stopFocus($)
+        return { text: 'Focus timer stopped.' }
+      }
+      if (value !== '' && !/^\d+$/.test(value)) return { text: 'Use /hud focus, /hud focus 50 or /hud focus stop.' }
+      const minutes = value === '' ? settings.focusMinutes : Math.min(240, Math.max(1, Number(value)))
+      await startFocus($, minutes)
+      return { text: `Focus for ${minutes} minutes, until ${formatClock(focus?.until ?? 0)}. Nudges stay quiet; a chime marks the end.` }
+    }
     // Every pane at once: open the ones that are closed, or close them all when all are open
     if (verb === 'all') {
       const panes: { id: string; title: string; load?: () => void }[] = [
@@ -740,6 +1051,7 @@ export const register: Register = on => {
         { id: TASKS_PANE, title: 'Tasks', load: () => void loadTasks($) },
         { id: CRAFT_PANE, title: 'Craft', load: () => void loadCraft($) },
         { id: KPI_PANE, title: 'KPIs', load: () => void loadKpis($).catch(() => {}) },
+        { id: GIT_PANE, title: 'Git', load: () => void loadRepos($) },
         {
           id: NEXT_PANE,
           title: 'Next',
@@ -972,6 +1284,12 @@ export const register: Register = on => {
           </Text>
         )}
         {git !== null && sep}
+        {focus !== null && (
+          <Text color={focus.mode === 'focus' ? 'magenta' : 'green'}>
+            {focus.mode === 'focus' ? '◷' : '☕'} {formatCountdown(focus.until - (await $.clock.now()))} {focus.mode}
+          </Text>
+        )}
+        {focus !== null && sep}
         {kpis !== null && (
           <Text>
             <Text dimColor>✎ </Text>
@@ -1407,7 +1725,7 @@ export const register: Register = on => {
           <Text color={today.prompts >= settings.goal ? 'green' : undefined}>
             {meter((today.prompts / settings.goal) * 100)} {today.prompts}/{settings.goal}
           </Text>
-          <Text dimColor> · {perHour.toFixed(1)} per active hour · {activeHours}h active</Text>
+          <Text dimColor> · {perHour.toFixed(1)} per active hour · {activeHours}h active{today.focus > 0 ? ` · ${today.focus} focus block${today.focus === 1 ? '' : 's'}` : ''}</Text>
         </Text>
         <Text>
           <Text dimColor>  hours   </Text>
@@ -1529,6 +1847,152 @@ export const register: Register = on => {
             {one.why !== '' && <Text dimColor wrap="truncate-end">{'   '}{one.why}</Text>}
           </Box>
         ))}
+      </Box>
+    )
+  })
+
+  on('ui.render', { component: 'Pane', requestId: GIT_PANE }, async ($, e) => {
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const now = await $.clock.now()
+    const fill = async (text: string) => {
+      const box = await $.prompt.read()
+      await $.prompt.fill(box.text.trim() === '' ? { text } : { text: ` ${text}`, mode: 'append' })
+    }
+    const busy = repos.filter(repo => repo.changed > 0 || repo.unpushed > 0 || repo.prs.length > 0)
+    const clean = repos.length - busy.length
+    return (
+      <Box flexDirection="column">
+        <Box flexDirection="row" columnGap={2}>
+          <Text dimColor wrap="truncate-end">
+            {reposState === 'loading'
+              ? 'Checking the repos you worked in this week…'
+              : reposState === 'error'
+                ? 'Could not check your repos'
+                : `${busy.length} with work left · ${clean} clean · ${formatSpan(now - reposAt)} ago`}
+          </Text>
+          <Button key="git-refresh" label="refresh" hotkey="r" plain onPress={() => void loadRepos($)} />
+        </Box>
+        {reposState === 'error' && <Text color="yellow" wrap="wrap">{reposError}</Text>}
+        {reposState === 'ready' && busy.length === 0 && <Text color="green">Everything is committed and pushed.</Text>}
+        {busy.map(repo => (
+          <Box flexDirection="column">
+            <Text wrap="truncate-end">
+              <Text bold color="cyan">{repo.name}</Text>
+              <Text dimColor> ⎇ {repo.branch}</Text>
+              {repo.commitsToday.length > 0 && <Text color="green"> · {repo.commitsToday.length} commits today</Text>}
+            </Text>
+            <Box flexDirection="row" columnGap={2} flexWrap="wrap">
+              {repo.changed > 0 && (
+                <Button
+                  key={`git-commit-${repo.top}`}
+                  label={`✎ ${repo.changed} uncommitted`}
+                  plain
+                  onPress={() => void fill(`In ${repo.top}: review the uncommitted changes on ${repo.branch}, then commit and push them.`).catch(() => {})}
+                />
+              )}
+              {repo.unpushed > 0 && (
+                <Button
+                  key={`git-push-${repo.top}`}
+                  label={`↑ ${repo.unpushed} unpushed`}
+                  plain
+                  onPress={() => void fill(`In ${repo.top}: push the ${repo.unpushed} unpushed commits on ${repo.branch}, and open a PR if there is none.`).catch(() => {})}
+                />
+              )}
+              {repo.prs.map(pr => (
+                <Button
+                  key={`git-pr-${repo.top}-${pr.number}`}
+                  label={`PR #${pr.number} ${pr.title.slice(0, 40)}`}
+                  plain
+                  onPress={() => void fill(`In ${repo.top}: review PR #${pr.number} (${pr.url}) and tell me what is left before merging.`).catch(() => {})}
+                />
+              ))}
+            </Box>
+          </Box>
+        ))}
+      </Box>
+    )
+  })
+
+  on('ui.render', { component: 'Pane', requestId: WRAP_PANE }, async ($, e) => {
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const now = await $.clock.now()
+    const commits = repos.reduce((sum, repo) => sum + repo.commitsToday.length, 0)
+    const pick = async (text: string) => {
+      const box = await $.prompt.read()
+      await $.prompt.fill(box.text.trim() === '' ? { text } : { text: ` ${text}`, mode: 'append' })
+    }
+    const section = (title: string, items: string[], color: string) =>
+      items.length === 0 ? null : (
+        <Box flexDirection="column">
+          <Text bold color={color}>{title}</Text>
+          {items.map(item => (
+            <Text wrap="wrap">  • {item}</Text>
+          ))}
+        </Box>
+      )
+    return (
+      <Box flexDirection="column">
+        <Box flexDirection="row" columnGap={2}>
+          <Text bold>{new Date(now).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}</Text>
+          <Button key="wrap-refresh" label="refresh" hotkey="r" plain onPress={() => void loadWrap($)} />
+          {wrap !== null && wrapState === 'ready' && (
+            <Button key="wrap-save" label="save to Craft" hotkey="s" plain onPress={() => void saveWrap($).catch(() => {})} />
+          )}
+        </Box>
+        <Text dimColor>
+          {kpis?.today.prompts ?? 0} prompts · {kpis?.today.focus ?? 0} focus blocks · {kpis?.today.tasksDone ?? 0} tasks done · {commits} commits
+        </Text>
+        {wrapState === 'loading' && <Text dimColor>Writing your wrap from today’s sessions, commits and tasks…</Text>}
+        {wrapState === 'error' && <Text color="yellow" wrap="wrap">Could not write the wrap: {wrapError}</Text>}
+        {wrap !== null && wrapState === 'ready' && (
+          <Box flexDirection="column">
+            {section('Done', wrap.done, 'green')}
+            {section('Open', wrap.open, 'yellow')}
+            {wrap.tomorrow.length > 0 && <Text bold color="cyan">Tomorrow</Text>}
+            {wrap.tomorrow.map((item, index) => (
+              <Button key={`wrap-next-${index}`} label={item} plain hotkey={String(index + 1)} onPress={() => void pick(item).catch(() => {})} />
+            ))}
+          </Box>
+        )}
+        {wrapSaved !== '' && <Text color={wrapSaved.startsWith('Saved') ? 'green' : 'yellow'} wrap="wrap">{wrapSaved}</Text>}
+      </Box>
+    )
+  })
+
+  on('ui.render', { component: 'Pane', requestId: HELP_PANE }, async ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
+    const row = (command: string, what: string) => (
+      <Text wrap="wrap">
+        <Text color="cyan">{command.padEnd(22)}</Text>
+        <Text dimColor>{what}</Text>
+      </Text>
+    )
+    return (
+      <Box flexDirection="column">
+        <Text bold>Panes</Text>
+        {row('/hud all', 'open every pane, or close them all')}
+        {row('/hud tools', 'tool calls with their reasons, subagent lanes')}
+        {row('/hud tasks', 'your open ClickUp tasks')}
+        {row('/hud craft', 'your Craft tasks, ✓ done twice to complete')}
+        {row('/hud kpi', 'prompts, streak, weekly and 5-hour pace')}
+        {row('/hud next', 'next prompts from your last 10 sessions')}
+        {row('/hud git', 'uncommitted, unpushed and PRs across repos')}
+        {row('/hud wrap', 'today’s wrap, save it to Craft')}
+        {row('/hud help', 'this help')}
+        <Text bold>Focus and nudges</Text>
+        {row('/hud focus [min]', `start a focus block (default ${settings.focusMinutes}m, ${settings.breakMinutes}m break)`)}
+        {row('/hud focus stop', 'stop the timer')}
+        {row('/hud goal <n>', `daily prompt goal (now ${settings.goal})`)}
+        {row('/hud idle <min|off>', `nudge after idle minutes (now ${settings.idleMinutes > 0 ? settings.idleMinutes : 'off'})`)}
+        {row('/hud hours <a-b>', `work hours, Mon-Fri (now ${settings.startHour}-${settings.endHour})`)}
+        {row('/hud sound on|off|test', `the chime (now ${settings.sound ? 'on' : 'off'})`)}
+        <Text bold>Other</Text>
+        {row('/hud', 'hide or show the band above the prompt')}
+        {row('/hud update', 'install the latest version and reload')}
+        <Text bold>Keys in a pane</Text>
+        {row('Ctrl+X Tab', 'focus the pane; then number keys pick, r refreshes')}
+        {row('Ctrl+X ↑ / ↓', 'make the pane bigger or smaller')}
+        {row('Ctrl+X X', 'close the pane')}
       </Box>
     )
   })

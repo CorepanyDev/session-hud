@@ -1,1 +1,1 @@
-{ "name": "session-hud", "version": "0.9.2", "description": "A HUD band above the prompt: git branch, context fill, cost, rate limit, tool calls and last turn time, plus a /hud tools pane listing each tool call and why", "author": { "name": "Cemal Sert" } }
+{ "name": "session-hud", "version": "0.10.0", "description": "A HUD band above the prompt: git branch, context fill, cost, rate limit, tool calls and last turn time, plus a /hud tools pane listing each tool call and why", "author": { "name": "Cemal Sert" } }

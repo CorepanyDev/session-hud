@@ -88,8 +88,8 @@ test('/hud all opens the closed panes, and closes them all when all are open', a
   })
 
   const opened = await $.command.run({ command: 'hud', args: 'all' })
-  expect(opened.text).toBe('Opened Tasks, Craft, KPIs, Next. Run /hud all again to close them all.')
-  expect([...open].sort()).toEqual(['hud-craft', 'hud-kpi', 'hud-next', 'hud-tasks', 'hud-tools'])
+  expect(opened.text).toBe('Opened Tasks, Craft, KPIs, Git, Next. Run /hud all again to close them all.')
+  expect([...open].sort()).toEqual(['hud-craft', 'hud-git', 'hud-kpi', 'hud-next', 'hud-tasks', 'hud-tools'])
 
   const closed = await $.command.run({ command: 'hud', args: 'all' })
   expect(closed.text).toBe('All HUD panes closed.')
